@@ -181,7 +181,7 @@ class FakeUploadConnection:
 
 
 class GiteaRawUploadTests(unittest.TestCase):
-    def test_upload_streams_exact_raw_octet_body(self):
+    def test_upload_streams_exact_raw_octet_body_with_chunked_transport(self):
         payload = b"release-package-bytes"
         response_record = {
             "id": 42,
@@ -219,9 +219,13 @@ class GiteaRawUploadTests(unittest.TestCase):
             ),
         )
         self.assertEqual(connection.headers["content-type"], "application/octet-stream")
-        self.assertEqual(connection.headers["content-length"], str(len(payload)))
+        self.assertEqual(connection.headers["transfer-encoding"], "chunked")
+        self.assertNotIn("content-length", connection.headers)
         self.assertNotIn("multipart", connection.headers["content-type"])
-        self.assertEqual(bytes(connection.body), payload)
+        self.assertEqual(
+            bytes(connection.body),
+            f"{len(payload):X}\r\n".encode("ascii") + payload + b"\r\n0\r\n\r\n",
+        )
         self.assertTrue(connection.closed)
 
 

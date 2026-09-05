@@ -859,11 +859,19 @@ class GiteaReleaseClient:
             # Gitea do not have to parse/spool another multi-gigabyte form
             # upload before committing the release attachment.
             connection.putheader("Content-Type", "application/octet-stream")
-            connection.putheader("Content-Length", str(size))
+            # Gitea's public reverse proxy can buffer a known-length request
+            # and abort a multi-gigabyte release attachment before the backend
+            # consumes it.  Stream HTTP/1.1 chunks instead, matching the
+            # transport Gitea uses for large LFS uploads.  This is transport
+            # framing only; Gitea receives the exact original file bytes.
+            connection.putheader("Transfer-Encoding", "chunked")
             connection.endheaders()
             with path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                    connection.send(f"{len(chunk):X}\r\n".encode("ascii"))
                     connection.send(chunk)
+                    connection.send(b"\r\n")
+            connection.send(b"0\r\n\r\n")
             response = connection.getresponse()
             payload = response.read()
         finally:
