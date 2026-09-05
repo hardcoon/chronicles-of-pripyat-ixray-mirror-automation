@@ -1,0 +1,108 @@
+name: Mirror release assets to Gitea
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Operation (run plan first)
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - probe-largest-full
+          - mirror
+      verify_existing_sha:
+        description: Download and hash every existing immutable package
+        required: true
+        default: true
+        type: boolean
+      source_tag:
+        description: Persistent GitHub release tag
+        required: true
+        default: dev-2026.08.26.1
+        type: string
+  schedule:
+    - cron: "23 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chronicles-of-pripyat-gitea-release-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    # Scheduled writes remain disabled until the owner enables both gates.
+    # Manual plan runs work while every gate is absent.
+    if: github.event_name == 'workflow_dispatch' || vars.GITEA_MIRROR_SCHEDULE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out mirror automation only
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Mirror manifest-selected assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_OPERATION: ${{ inputs.operation }}
+          INPUT_VERIFY_EXISTING_SHA: ${{ inputs.verify_existing_sha }}
+          INPUT_SOURCE_TAG: ${{ inputs.source_tag }}
+          WRITE_ENABLED: ${{ vars.GITEA_MIRROR_WRITE_ENABLED }}
+          SCHEDULE_ENABLED: ${{ vars.GITEA_MIRROR_SCHEDULE_ENABLED }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_tag="${INPUT_SOURCE_TAG:-dev-2026.08.26.1}"
+          operation="${INPUT_OPERATION:-mirror}"
+          if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
+            if [[ "$SCHEDULE_ENABLED" != "true" || "$WRITE_ENABLED" != "true" ]]; then
+              echo "Scheduled mirroring is gated off" >&2
+              exit 2
+            fi
+            operation="mirror"
+          elif [[ "$operation" != "plan" && "$WRITE_ENABLED" != "true" ]]; then
+            echo "Set GITEA_MIRROR_WRITE_ENABLED=true only after reviewing a plan" >&2
+            exit 2
+          fi
+          args=(
+            --github-repo hardcoon/chronicles-of-pripyat-ixray
+            --github-tag "$source_tag"
+            --gitea-url https://gitea.com
+            --gitea-repo hardcoon/chronicles-of-pripyat-ixray-downloads
+            --gitea-tag dev-channel
+            --plan-out "$RUNNER_TEMP/gitea-mirror-plan.json"
+            --receipt-out "$RUNNER_TEMP/gitea-mirror-receipt.json"
+          )
+          case "$operation" in
+            plan) args+=(--dry-run) ;;
+            probe-largest-full) args+=(--probe-largest-full) ;;
+            mirror) ;;
+            *) echo "Unsupported operation: $operation" >&2; exit 2 ;;
+          esac
+          if [[ "$INPUT_VERIFY_EXISTING_SHA" == "true" ]]; then
+            args+=(--verify-existing-sha)
+          fi
+          python mirror_release_assets.py "${args[@]}"
+
+      - name: Save plan and receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitea-mirror-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/gitea-mirror-plan.json
+            ${{ runner.temp }}/gitea-mirror-receipt.json
+          if-no-files-found: warn
+          retention-days: 30

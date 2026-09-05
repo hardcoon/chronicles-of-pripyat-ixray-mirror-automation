@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+dry-run-plan.json
+gitea-mirror-plan.json
+gitea-mirror-receipt.json
+mirror-plan-*.json
+mirror-receipt-*.json
+bootstrap-probe.txt
