@@ -20,15 +20,19 @@ from mirror_release_assets import (
     download_file,
     effective_existing_sha_verification,
     largest_full_package,
+    load_published_state,
     manifest_identity,
     ordered_specs,
     parse_args,
+    planned_action,
     published_manifest_candidates,
+    require_certified_targets,
     replace_mutable_attachment,
     rollback_override_enabled,
     sync_asset,
     validate_asset_name,
     validate_manifest_progression,
+    verify_public_target,
 )
 
 
@@ -42,11 +46,13 @@ def package(name: str, size: int, digest: str):
 
 
 def target(asset_id: int, name: str, size: int = 3) -> TargetAsset:
+    asset_uuid = f"00000000-0000-0000-0000-{asset_id:012x}"
     return TargetAsset(
         id=asset_id,
+        uuid=asset_uuid,
         name=name,
         size=size,
-        download_url=f"https://example.invalid/attachments/{asset_id}",
+        download_url=f"https://example.invalid/attachments/{asset_uuid}",
     )
 
 
@@ -75,6 +81,7 @@ class FakeGiteaClient:
         upload_failure=None,
         rename_failure=None,
         delete_failure=None,
+        rename_uuid_change=False,
     ):
         self.assets = {asset.id: asset for asset in assets}
         self.events = events if events is not None else []
@@ -82,6 +89,7 @@ class FakeGiteaClient:
         self.upload_failure = upload_failure
         self.rename_failure = rename_failure
         self.delete_failure = delete_failure
+        self.rename_uuid_change = rename_uuid_change
 
     def grouped(self):
         grouped = {}
@@ -112,7 +120,19 @@ class FakeGiteaClient:
             self.rename_failure = None
             raise TimeoutError("rename timed out before commit")
         current = self.assets[asset_id]
-        renamed = TargetAsset(current.id, name, current.size, current.download_url)
+        if self.rename_uuid_change:
+            changed = target(current.id + 1000, name, current.size)
+            renamed = TargetAsset(
+                current.id,
+                changed.uuid,
+                name,
+                current.size,
+                changed.download_url,
+            )
+        else:
+            renamed = TargetAsset(
+                current.id, current.uuid, name, current.size, current.download_url
+            )
         self.assets[asset_id] = renamed
         if self.rename_failure == "after":
             self.rename_failure = None
@@ -194,6 +214,21 @@ class ManifestAssetsTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(MirrorError):
                 validate_asset_name(name)
 
+    def test_packages_cannot_use_mutable_transaction_namespaces(self):
+        reserved = (
+            "manifest-dev.json",
+            "manifest-dev.json.pending-aaaaaaaaaaaa-1-abcdef",
+            "ChroniclesLauncher.exe.previous-1-aaaaaaaaaaaa-1-abcdef",
+            "ChroniclesLauncher.exe.failed-aaaaaaaaaaaa-1-abcdef",
+        )
+        for name in reserved:
+            with self.subTest(name=name), self.assertRaisesRegex(
+                MirrorError, "reserved mutable namespace"
+            ):
+                collect_manifest_assets(
+                    {"fullPackages": [package(name, 10, SHA_A)]}
+                )
+
     def test_largest_full_package_is_selected_deterministically(self):
         manifest = {
             "fullPackages": [
@@ -219,23 +254,65 @@ class ManifestAssetsTests(unittest.TestCase):
             "assets": [
                 {
                     "id": 1,
+                    "uuid": "00000000-0000-0000-0000-000000000001",
                     "name": "manifest-dev.json",
                     "size": 3,
-                    "browser_download_url": "https://example.invalid/a/1",
+                    "browser_download_url": "https://example.invalid/releases/download/dev-channel/manifest-dev.json",
                 },
                 {
                     "id": 2,
+                    "uuid": "00000000-0000-0000-0000-000000000002",
                     "name": "manifest-dev.json",
                     "size": 4,
-                    "browser_download_url": "https://example.invalid/a/2",
+                    "browser_download_url": "https://example.invalid/releases/download/dev-channel/manifest-dev.json",
                 },
             ]
         }
-        assets = GiteaReleaseClient.release_assets(release)
+        client = GiteaReleaseClient(
+            "https://example.invalid", "owner/repo", token=None
+        )
+        assets = client.release_assets(release)
         self.assertEqual([item.id for item in assets["manifest-dev.json"]], [1, 2])
+        self.assertNotEqual(
+            assets["manifest-dev.json"][0].download_url,
+            assets["manifest-dev.json"][1].download_url,
+        )
+
+    def test_gitea_asset_parser_requires_unique_valid_uuids(self):
+        client = GiteaReleaseClient(
+            "https://example.invalid", "owner/repo", token=None
+        )
+        base = {
+            "name": "asset.zip",
+            "size": 3,
+            "browser_download_url": "https://example.invalid/releases/download/tag/asset.zip",
+        }
+        with self.assertRaisesRegex(MirrorError, "attachment UUID"):
+            client.release_assets({"assets": [{"id": 1, **base}]})
+
+        first = {
+            "id": 1,
+            "uuid": "00000000-0000-0000-0000-000000000001",
+            **base,
+        }
+        second = {**first, "id": 2}
+        with self.assertRaisesRegex(MirrorError, "duplicate Gitea attachment UUID"):
+            client.release_assets({"assets": [first, second]})
+
+    def test_public_verification_uses_constructed_uuid_route(self):
+        asset = target(42, "asset.zip")
+        spec = AssetSpec("asset.zip", 3, SHA_A, "fullPackages[0]")
+        with tempfile.TemporaryDirectory() as temp_name, patch.object(
+            mirror, "download_file", return_value=(3, SHA_A)
+        ) as download:
+            verify_public_target(asset, spec, Path(temp_name))
+        self.assertEqual(download.call_args.args[0], asset.download_url)
+        self.assertTrue(download.call_args.args[0].endswith(f"/attachments/{asset.uuid}"))
 
     def test_legacy_previous_manifest_remains_the_rollback_checkpoint(self):
-        previous = target(7, "manifest-dev.json.previous-7-old-run")
+        previous = target(
+            7, "manifest-dev.json.previous-7-aaaaaaaaaaaa-1788633828-13ac34"
+        )
         self.assertEqual(
             published_manifest_candidates(
                 {previous.name: [previous]}, "manifest-dev.json"
@@ -329,6 +406,199 @@ class ManifestProgressionTests(unittest.TestCase):
         )
 
 
+class PublishedStateTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.temp_root = Path(self.temp.name)
+        self.client = GiteaReleaseClient(
+            "https://example.invalid", "owner/repo", token=None
+        )
+
+    @staticmethod
+    def manifest(version, digest, package_sha=SHA_A):
+        return json.dumps(
+            {
+                "version": version,
+                "contentHash": digest,
+                "fullPackages": [package("full.zip", 10, package_sha)],
+            }
+        ).encode("utf-8")
+
+    def load(self, assets, payloads):
+        def fake_download(url, destination, **kwargs):
+            payload = payloads[url]
+            destination.write_bytes(payload)
+            return len(payload), hashlib.sha256(payload).hexdigest()
+
+        grouped = FakeGiteaClient(assets).grouped()
+        with patch.object(mirror, "download_file", side_effect=fake_download):
+            return load_published_state(
+                self.client,
+                grouped,
+                "manifest-dev.json",
+                "ChroniclesLauncher.exe",
+                self.temp_root,
+            )
+
+    def test_canonical_and_exact_previous_both_guard_progression(self):
+        canonical = target(10, "manifest-dev.json", 100)
+        previous = target(
+            11,
+            "manifest-dev.json.previous-11-aaaaaaaaaaaa-1788633828-13ac34",
+            100,
+        )
+        canonical_bytes = self.manifest("2026.09.01-dev.28", SHA_A)
+        previous_bytes = self.manifest("2026.09.03-dev.30", SHA_B)
+        canonical = TargetAsset(
+            canonical.id,
+            canonical.uuid,
+            canonical.name,
+            len(canonical_bytes),
+            canonical.download_url,
+        )
+        previous = TargetAsset(
+            previous.id,
+            previous.uuid,
+            previous.name,
+            len(previous_bytes),
+            previous.download_url,
+        )
+        state = self.load(
+            [canonical, previous],
+            {
+                canonical.download_url: canonical_bytes,
+                previous.download_url: previous_bytes,
+            },
+        )
+        self.assertEqual(
+            [item.dev_number for item in state.identities], [28, 30]
+        )
+        source_29 = ManifestIdentity("2026.09.02-dev.29", 29, SHA_A, SHA_C)
+        with self.assertRaisesRegex(MirrorError, "rollback"):
+            validate_manifest_progression(
+                source_29, state.identities, allow_rollback=False
+            )
+        source_31 = ManifestIdentity("2026.09.04-dev.31", 31, SHA_C, SHA_C)
+        self.assertEqual(
+            validate_manifest_progression(
+                source_31, state.identities, allow_rollback=False
+            ),
+            "advance",
+        )
+
+    def test_trust_map_is_exact_and_conflicts_fail_closed(self):
+        first_bytes = self.manifest("2026.09.01-dev.28", SHA_A, SHA_A)
+        second_bytes = self.manifest("2026.09.02-dev.29", SHA_B, SHA_B)
+        first = target(1, "manifest-dev.json", len(first_bytes))
+        second = target(
+            2,
+            "manifest-dev.json.previous-2-bbbbbbbbbbbb-1788633828-13ac34",
+            len(second_bytes),
+        )
+        with self.assertRaisesRegex(MirrorError, "checkpoints conflict"):
+            self.load(
+                [first, second],
+                {
+                    first.download_url: first_bytes,
+                    second.download_url: second_bytes,
+                },
+            )
+
+
+class ImmutableTrustTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.temp_root = Path(self.temp.name)
+        self.spec = AssetSpec("full.zip", 3, SHA_A, "fullPackages[0]")
+        self.existing = target(7, self.spec.name)
+        self.source = SourceAsset(
+            self.spec.name, self.spec.size, self.spec.sha256, "https://source.invalid"
+        )
+
+    def sync(self, *, trusted=frozenset(), verification=None):
+        certifications = {}
+        client = FakeGiteaClient([self.existing])
+        context = (
+            patch.object(mirror, "verify_public_target", side_effect=verification)
+            if verification is not None
+            else patch.object(mirror, "verify_public_target")
+        )
+        with context as verify:
+            result = sync_asset(
+                spec=self.spec,
+                source=self.source,
+                mutable=False,
+                verify_existing_sha=False,
+                client=client,
+                release_id=99,
+                tag="dev-channel",
+                existing_assets=client.grouped(),
+                temp_root=self.temp_root,
+                trusted_assets=trusted,
+                certifications=certifications,
+                cleanup_authorized=True,
+            )
+        return result, certifications, verify
+
+    def test_exact_published_triple_certifies_one_id_without_rehash(self):
+        result, certifications, verify = self.sync(
+            trusted=frozenset({mirror.asset_trust_key(self.spec)})
+        )
+        self.assertEqual(result, "certified-existing")
+        verify.assert_not_called()
+        self.assertEqual(certifications[self.spec.name].id, self.existing.id)
+        require_certified_targets(
+            {self.spec.name: [self.existing]}, [self.spec], certifications
+        )
+
+    def test_orphan_existing_asset_is_anonymously_hashed(self):
+        result, _, verify = self.sync()
+        self.assertEqual(result, "verified-existing")
+        verify.assert_called_once_with(self.existing, self.spec, self.temp_root)
+
+    def test_plan_labels_orphan_existing_asset_for_verification(self):
+        self.assertEqual(
+            planned_action(
+                self.spec,
+                [self.existing],
+                mutable=False,
+                verify_existing_sha=False,
+                trusted_assets=frozenset(),
+            ),
+            "verify-untrusted",
+        )
+        self.assertEqual(
+            planned_action(
+                self.spec,
+                [self.existing],
+                mutable=False,
+                verify_existing_sha=False,
+                trusted_assets=frozenset({mirror.asset_trust_key(self.spec)}),
+            ),
+            "reuse-certified",
+        )
+
+    def test_different_published_sha_does_not_trust_same_name_and_size(self):
+        prior = AssetSpec(self.spec.name, self.spec.size, SHA_B, "published")
+        with self.assertRaisesRegex(MirrorError, "wrong SHA"):
+            self.sync(
+                trusted=frozenset({mirror.asset_trust_key(prior)}),
+                verification=MirrorError("wrong SHA"),
+            )
+
+    def test_pre_manifest_gate_rejects_changed_target_id(self):
+        _, certifications, _ = self.sync(
+            trusted=frozenset({mirror.asset_trust_key(self.spec)})
+        )
+        replacement = target(8, self.spec.name)
+        with self.assertRaisesRegex(MirrorError, "certification changed"):
+            require_certified_targets(
+                {self.spec.name: [replacement]}, [self.spec], certifications
+            )
+
+
 class MutablePublicationTests(unittest.TestCase):
     def setUp(self):
         self.spec = AssetSpec("manifest-dev.json", 3, SHA_A, "manifest-last")
@@ -366,6 +636,7 @@ class MutablePublicationTests(unittest.TestCase):
                 source_path=self.source_path,
                 spec=self.spec,
                 temp_root=self.temp_root,
+                cleanup_authorized=True,
             )
 
     def test_existing_canonical_is_kept_until_new_id_is_verified(self):
@@ -432,6 +703,7 @@ class MutablePublicationTests(unittest.TestCase):
                     source_path=self.source_path,
                     spec=self.spec,
                     temp_root=self.temp_root,
+                    cleanup_authorized=True,
                 )
 
         self.assertEqual(client.assets[self.old.id].name, self.spec.name)
@@ -462,10 +734,55 @@ class MutablePublicationTests(unittest.TestCase):
                     source_path=self.source_path,
                     spec=self.spec,
                     temp_root=self.temp_root,
+                    cleanup_authorized=True,
                 )
 
         self.assertEqual(set(client.assets), {self.old.id})
         self.assertNotIn(("delete", self.old.id), events)
+        self.assertEqual(
+            [event for event in events if event[0] == "delete"],
+            [("delete", 2)],
+        )
+
+    def test_failed_recovered_staged_verification_deletes_nothing(self):
+        events = []
+        pending = target(
+            2, f"{self.spec.name}.pending-{self.spec.sha256[:12]}-1788633828-13ac34"
+        )
+        client = FakeGiteaClient([self.old, pending], events=events)
+        pending_checks = 0
+
+        def fail_recheck(asset, spec, temp_root):
+            nonlocal pending_checks
+            events.append(("verify-id", asset.id, asset.name))
+            if asset.id == self.old.id:
+                raise MirrorError("old content")
+            pending_checks += 1
+            if pending_checks == 2:
+                raise MirrorError("recovered staged network failure")
+
+        with patch.object(
+            mirror, "verify_public_target", side_effect=fail_recheck
+        ):
+            with self.assertRaisesRegex(MirrorError, "recovered staged"):
+                sync_asset(
+                    spec=self.spec,
+                    source=SourceAsset(
+                        self.spec.name, 3, SHA_A, "https://source.invalid"
+                    ),
+                    mutable=True,
+                    verify_existing_sha=True,
+                    client=client,
+                    release_id=99,
+                    tag="dev-channel",
+                    existing_assets=client.grouped(),
+                    temp_root=self.temp_root,
+                    trusted_assets=frozenset(),
+                    certifications={},
+                    cleanup_authorized=True,
+                )
+        self.assertFalse(any(event[0] == "delete" for event in events))
+        self.assertEqual(set(client.assets), {self.old.id, pending.id})
 
     def test_timeout_after_successful_upload_is_reconciled(self):
         events = []
@@ -484,6 +801,31 @@ class MutablePublicationTests(unittest.TestCase):
         self.run_replace(client, [self.old])
         self.assertEqual(len(client.assets), 1)
         self.assertNotIn(self.old.id, client.assets)
+
+    def test_uuid_change_during_rename_fails_without_delete(self):
+        events = []
+        client = FakeGiteaClient(
+            [self.old], events=events, rename_uuid_change=True
+        )
+        verify, verify_canonical = self.verification(events)
+        with patch.object(
+            mirror, "verify_public_target", side_effect=verify
+        ), patch.object(
+            mirror, "verify_public_canonical", side_effect=verify_canonical
+        ), patch.object(mirror.time, "sleep"):
+            with self.assertRaisesRegex(MirrorError, "server state"):
+                replace_mutable_attachment(
+                    client=client,
+                    release_id=99,
+                    tag="dev-channel",
+                    existing=[self.old],
+                    source_path=self.source_path,
+                    spec=self.spec,
+                    temp_root=self.temp_root,
+                    cleanup_authorized=True,
+                )
+        self.assertNotIn(("delete", self.old.id), events)
+        self.assertFalse(any(event[0] == "delete" for event in events))
 
     def test_post_rename_verification_failure_keeps_old_canonical(self):
         events = []
@@ -510,6 +852,7 @@ class MutablePublicationTests(unittest.TestCase):
                     source_path=self.source_path,
                     spec=self.spec,
                     temp_root=self.temp_root,
+                    cleanup_authorized=True,
                 )
 
         canonical_ids = {
@@ -536,11 +879,107 @@ class MutablePublicationTests(unittest.TestCase):
                 tag="dev-channel",
                 existing_assets=client.grouped(),
                 temp_root=self.temp_root,
+                trusted_assets=frozenset(),
+                certifications={},
+                cleanup_authorized=True,
             )
 
         self.assertEqual(result, "reconciled-existing")
         self.assertEqual(set(client.assets), {new.id})
         self.assertIn(("delete", self.old.id), events)
+
+    def test_duplicate_name_reconciliation_uses_each_uuid_not_raw_name_url(self):
+        events = []
+        newer = target(2, self.spec.name)
+        client = FakeGiteaClient([self.old, newer], events=events)
+        verify, verify_canonical = self.verification(
+            events, valid_ids={self.old.id}
+        )
+        with patch.object(
+            mirror, "verify_public_target", side_effect=verify
+        ), patch.object(
+            mirror, "verify_public_canonical", side_effect=verify_canonical
+        ):
+            result = sync_asset(
+                spec=self.spec,
+                source=SourceAsset(
+                    self.spec.name, 3, SHA_A, "https://source.invalid"
+                ),
+                mutable=True,
+                verify_existing_sha=True,
+                client=client,
+                release_id=99,
+                tag="dev-channel",
+                existing_assets=client.grouped(),
+                temp_root=self.temp_root,
+                trusted_assets=frozenset(),
+                certifications={},
+                cleanup_authorized=True,
+            )
+        self.assertEqual(result, "reconciled-existing")
+        self.assertEqual(set(client.assets), {self.old.id})
+        checked_ids = {
+            event[1] for event in events if event[0] == "verify-id"
+        }
+        self.assertEqual(checked_ids, {self.old.id, newer.id})
+
+    def test_duplicate_uuid_fails_before_any_cleanup(self):
+        events = []
+        alias = TargetAsset(
+            2,
+            self.old.uuid,
+            self.spec.name,
+            self.old.size,
+            self.old.download_url,
+        )
+        client = FakeGiteaClient([self.old, alias], events=events)
+        with self.assertRaisesRegex(MirrorError, "duplicate Gitea attachment UUID"):
+            sync_asset(
+                spec=self.spec,
+                source=SourceAsset(
+                    self.spec.name, 3, SHA_A, "https://source.invalid"
+                ),
+                mutable=True,
+                verify_existing_sha=True,
+                client=client,
+                release_id=99,
+                tag="dev-channel",
+                existing_assets=client.grouped(),
+                temp_root=self.temp_root,
+                trusted_assets=frozenset(),
+                certifications={},
+                cleanup_authorized=True,
+            )
+        self.assertFalse(any(event[0] == "delete" for event in events))
+
+    def test_cleanup_requires_successful_progression_guard(self):
+        events = []
+        newer = target(2, self.spec.name)
+        client = FakeGiteaClient([self.old, newer], events=events)
+        verify, verify_canonical = self.verification(events)
+        with patch.object(
+            mirror, "verify_public_target", side_effect=verify
+        ), patch.object(
+            mirror, "verify_public_canonical", side_effect=verify_canonical
+        ):
+            with self.assertRaisesRegex(MirrorError, "progression guard"):
+                sync_asset(
+                    spec=self.spec,
+                    source=SourceAsset(
+                        self.spec.name, 3, SHA_A, "https://source.invalid"
+                    ),
+                    mutable=True,
+                    verify_existing_sha=True,
+                    client=client,
+                    release_id=99,
+                    tag="dev-channel",
+                    existing_assets=client.grouped(),
+                    temp_root=self.temp_root,
+                    trusted_assets=frozenset(),
+                    certifications={},
+                    cleanup_authorized=False,
+                )
+        self.assertFalse(any(event[0] == "delete" for event in events))
 
     def test_replay_with_two_valid_canonicals_keeps_highest_id(self):
         events = []
@@ -560,6 +999,9 @@ class MutablePublicationTests(unittest.TestCase):
                 tag="dev-channel",
                 existing_assets=client.grouped(),
                 temp_root=self.temp_root,
+                trusted_assets=frozenset(),
+                certifications={},
+                cleanup_authorized=True,
             )
 
         self.assertEqual(set(client.assets), {new.id})
@@ -581,15 +1023,47 @@ class MutablePublicationTests(unittest.TestCase):
                 tag="dev-channel",
                 existing_assets=client.grouped(),
                 temp_root=self.temp_root,
+                trusted_assets=frozenset(),
+                certifications={},
+                cleanup_authorized=True,
             )
 
         self.assertEqual(result, "verified-existing")
         self.assertFalse(any(event[0] == "delete" for event in events))
 
+    def test_unowned_prefix_shaped_assets_are_never_swept(self):
+        events = []
+        unrelated = target(9, f"{self.spec.name}.pending-not-our-transaction")
+        client = FakeGiteaClient([self.old, unrelated], events=events)
+        verify, verify_canonical = self.verification(events)
+        with patch.object(
+            mirror, "verify_public_target", side_effect=verify
+        ), patch.object(
+            mirror, "verify_public_canonical", side_effect=verify_canonical
+        ):
+            sync_asset(
+                spec=self.spec,
+                source=SourceAsset(
+                    self.spec.name, 3, SHA_A, "https://source.invalid"
+                ),
+                mutable=True,
+                verify_existing_sha=True,
+                client=client,
+                release_id=99,
+                tag="dev-channel",
+                existing_assets=client.grouped(),
+                temp_root=self.temp_root,
+                trusted_assets=frozenset(),
+                certifications={},
+                cleanup_authorized=True,
+            )
+        self.assertEqual(set(client.assets), {self.old.id, unrelated.id})
+        self.assertFalse(any(event[0] == "delete" for event in events))
+
     def test_replay_reuses_verified_pending_instead_of_uploading_again(self):
         events = []
         pending = target(
-            2, f"{self.spec.name}.pending-{self.spec.sha256[:12]}-old-run"
+            2, f"{self.spec.name}.pending-{self.spec.sha256[:12]}-1788633828-13ac34"
         )
         client = FakeGiteaClient([self.old, pending], events=events)
         verify, verify_canonical = self.verification(events, valid_ids={pending.id})
@@ -606,6 +1080,9 @@ class MutablePublicationTests(unittest.TestCase):
                 tag="dev-channel",
                 existing_assets=client.grouped(),
                 temp_root=self.temp_root,
+                trusted_assets=frozenset(),
+                certifications={},
+                cleanup_authorized=True,
             )
 
         self.assertEqual(result, "replaced")
@@ -614,9 +1091,12 @@ class MutablePublicationTests(unittest.TestCase):
 
     def test_legacy_previous_is_restored_before_pending_handover(self):
         events = []
-        previous = target(1, f"{self.spec.name}.previous-1-old-run")
+        previous = target(
+            1,
+            f"{self.spec.name}.previous-1-{self.spec.sha256[:12]}-1788633828-13ac34",
+        )
         pending = target(
-            2, f"{self.spec.name}.pending-{self.spec.sha256[:12]}-old-run"
+            2, f"{self.spec.name}.pending-{self.spec.sha256[:12]}-1788633828-13ac34"
         )
         client = FakeGiteaClient([previous, pending], events=events)
         verify, verify_canonical = self.verification(events, valid_ids={pending.id})
@@ -633,6 +1113,9 @@ class MutablePublicationTests(unittest.TestCase):
                 tag="dev-channel",
                 existing_assets=client.grouped(),
                 temp_root=self.temp_root,
+                trusted_assets=frozenset(),
+                certifications={},
+                cleanup_authorized=True,
             )
 
         renames = [event for event in events if event[0] == "rename"]

@@ -28,15 +28,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  mirror:
-    # Scheduled writes remain disabled until the owner enables both gates.
-    # Manual plan runs work while every gate is absent.
+  plan:
+    # Deliberately credential-free with respect to Gitea. It runs before each
+    # write so the exact checked-out SHA gets a dry-run gate.
     if: github.event_name == 'workflow_dispatch' || vars.GITEA_MIRROR_SCHEDULE_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Check out mirror automation only
+      - name: Check out the dispatched automation SHA
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -47,13 +50,14 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Plan manifest-selected assets
-        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'plan'
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          INPUT_OPERATION: ${{ inputs.operation }}
           INPUT_VERIFY_EXISTING_SHA: ${{ inputs.verify_existing_sha }}
         shell: bash
         run: |
           set -euo pipefail
+          operation="${INPUT_OPERATION:-mirror}"
           args=(
             --github-repo hardcoon/chronicles-of-pripyat-ixray
             --github-tag dev-2026.08.26.1
@@ -63,15 +67,57 @@ jobs:
             --dry-run
             --plan-out "$RUNNER_TEMP/gitea-mirror-plan.json"
           )
+          if [[ "$operation" == "probe-largest-full" ]]; then
+            args+=(--probe-largest-full)
+          fi
           if [[ "$INPUT_VERIFY_EXISTING_SHA" == "true" ]]; then
             args+=(--verify-existing-sha)
           fi
           python mirror_release_assets.py "${args[@]}"
 
+      - name: Save plan
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gitea-mirror-plan-${{ github.run_id }}
+          path: ${{ runner.temp }}/gitea-mirror-plan.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  write:
+    needs: plan
+    if: >-
+      github.event.repository.default_branch == 'main' &&
+      github.ref == 'refs/heads/main' &&
+      (
+        (
+          github.event_name == 'workflow_dispatch' &&
+          inputs.operation != 'plan' &&
+          vars.GITEA_MIRROR_WRITE_ENABLED == 'true'
+        ) ||
+        (
+          github.event_name == 'schedule' &&
+          vars.GITEA_MIRROR_WRITE_ENABLED == 'true' &&
+          vars.GITEA_MIRROR_SCHEDULE_ENABLED == 'true'
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    environment:
+      name: gitea-production
+    steps:
+      - name: Check out the guarded main SHA
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
       - name: Mirror manifest-selected assets
-        if: >-
-          github.event_name == 'schedule' ||
-          (github.event_name == 'workflow_dispatch' && inputs.operation != 'plan')
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
@@ -100,7 +146,7 @@ jobs:
             --gitea-url https://gitea.com
             --gitea-repo hardcoon/chronicles-of-pripyat-ixray-downloads
             --gitea-tag dev-channel
-            --plan-out "$RUNNER_TEMP/gitea-mirror-plan.json"
+            --plan-out "$RUNNER_TEMP/gitea-mirror-write-plan.json"
             --receipt-out "$RUNNER_TEMP/gitea-mirror-receipt.json"
           )
           case "$operation" in
@@ -113,13 +159,13 @@ jobs:
           fi
           python mirror_release_assets.py "${args[@]}"
 
-      - name: Save plan and receipt
+      - name: Save write plan and receipt
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: gitea-mirror-${{ github.run_id }}
+          name: gitea-mirror-write-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/gitea-mirror-plan.json
+            ${{ runner.temp }}/gitea-mirror-write-plan.json
             ${{ runner.temp }}/gitea-mirror-receipt.json
           if-no-files-found: warn
           retention-days: 30

@@ -27,7 +27,11 @@ deleting data. The mutable launcher and manifest use a staged, anonymous
 SHA-verified handover. Gitea permits duplicate attachment names, so a
 replacement is renamed to the canonical name while the previous canonical ID
 still exists. The previous ID is deleted only after the new ID passes another
-anonymous check. The stable
+anonymous check through its per-attachment UUID URL. Gitea's API normally
+returns a name-based `browser_download_url`, which is ambiguous during this
+handover; the script requires every API record to have a unique valid UUID and
+constructs `/attachments/<uuid>` for identity-bound verification. A missing,
+repeated, or changed UUID fails closed before deletion. The stable
 `/releases/download/dev-channel/<canonical-name>` route is checked after the
 old ID is gone. There is no interval in which an already-published canonical
 name is absent.
@@ -39,21 +43,30 @@ times out after Gitea actually committed it, the script refreshes the Release
 and reconciles the result by attachment ID. A rerun also repairs a verified
 `.pending-...` upload, duplicate canonical IDs left between rename and delete,
 and the `.previous-...` state created by the superseded swap implementation.
-It never deletes the sole verified canonical attachment.
+Only the exact legacy transaction syntax is recognized; arbitrary
+prefix-shaped attachments are not transaction-owned and are never swept. A
+recovered pending ID is also left intact if its repeat verification fails. The
+script never deletes the sole verified canonical attachment.
 
 Before any write, the source manifest is compared with every canonical target
-manifest. Versions must use `YYYY.MM.DD-dev.N`; the global `N`, not the date,
-is monotonic. A larger `N` advances the mirror. Equal `N` is idempotent only
-when `contentHash` also matches. A lower `N` or equal `N` with different
-content fails closed. The workflow fixes all writes to the persistent source
-tag `dev-2026.08.26.1`; it has no manual `source_tag` write input.
+manifest and every exactly recognized legacy `.previous-...` checkpoint.
+Versions must use `YYYY.MM.DD-dev.N`; the global `N`, not the date, is
+monotonic. A larger `N` advances the mirror. Equal `N` is idempotent only when
+`contentHash` also matches. A lower `N` or equal `N` with different content
+fails closed. Cleanup is enabled only after this complete checkpoint set has
+passed the progression guard. The workflow fixes all writes to the persistent
+source tag `dev-2026.08.26.1`; it has no manual `source_tag` write input.
 
 There is deliberately no sweep that deletes old, unreferenced, or otherwise
 "stale" Release assets. This matters because an older delta can still be a
 valid transition for an installed game. The only deletions performed by the
-script are narrowly transactional: its own failed temporary upload and the
-exact previous canonical launcher/manifest after a verified replacement.
-Immutable ZIP packages and unrelated attachments are never deleted.
+script are narrowly transactional: the exact ID/UUID returned for its current
+failed temporary upload and the explicit previous canonical IDs captured by a
+replacement after the new UUID is verified. It does not delete temporary IDs
+merely because their names share `.pending-` or `.previous-` prefixes.
+Immutable ZIP packages and unrelated attachments are never deleted. Package
+names underneath launcher/manifest mutable namespaces are rejected by schema
+validation so package data can never be mistaken for transaction state.
 
 Transfers are sequential and use a single file per Gitea API request. A hosted
 GitHub Actions runner processes only one asset at a time. During anonymous
@@ -171,14 +184,21 @@ Documentation is not proof of the hosted instance's effective limit.
 ## Existing-asset verification policy
 
 Every new or replaced attachment is downloaded anonymously from Gitea and
-hashed. Mutable `ChroniclesLauncher.exe` and `manifest-dev.json` are re-hashed
-on every run. Unchanged, content/version-named ZIPs are normally reused after
-exact name and size checks so an hourly no-op does not re-download 20.8 GB.
-Use `--verify-existing-sha` for periodic full storage audits; bootstrap enables
-the same check automatically. The launcher independently validates every
-downloaded package SHA-256 against the manifest before installation.
+hashed through its constructed UUID route. Mutable `ChroniclesLauncher.exe`
+and `manifest-dev.json` are re-hashed on every run. Published canonical and
+exact legacy-checkpoint manifests are themselves UUID-downloaded, parsed, and
+combined into a strict immutable trust map. An existing package can skip a
+full audit only when its exact `(name, size, sha256)` tuple occurs in that map;
+conflicting historical tuples for one name fail closed. An orphan asset, or a
+same-name/size asset whose expected SHA is not certified by the map, is always
+anonymously hashed and a mismatch aborts without deletion. Use
+`--verify-existing-sha` to re-hash even certified packages.
 
-Bootstrap is stricter regardless of CLI flags: until a valid canonical target
-manifest exists, every pre-existing referenced package (including a successful
-large-file probe) is downloaded anonymously and SHA-verified. Name/size reuse
-is enabled only after a completed canonical manifest establishes prior trust.
+Every successful hash or trust-map reuse creates an in-memory certificate for
+one exact target `(id, uuid, name, size, sha256)`. Immediately before the
+manifest switch, a fresh Release snapshot must still contain exactly those
+certified IDs and UUIDs for every package and the launcher. A size-only asset
+listing can never satisfy this gate. Bootstrap naturally hashes every
+pre-existing package because no published manifest can yet supply trust. The
+launcher independently validates every downloaded package SHA-256 before
+installation.

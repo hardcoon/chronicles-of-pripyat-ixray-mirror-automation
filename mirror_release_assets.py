@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
 
 USER_AGENT = "chronicles-of-pripyat-gitea-mirror/1.0"
@@ -72,6 +72,7 @@ class SourceAsset:
 @dataclasses.dataclass(frozen=True)
 class TargetAsset:
     id: int
+    uuid: str
     name: str
     size: int
     download_url: str
@@ -86,6 +87,35 @@ class ManifestIdentity:
     dev_number: int
     content_hash: str
     sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class PublishedManifest:
+    asset: TargetAsset
+    identity: ManifestIdentity
+    packages: tuple[AssetSpec, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class PublishedState:
+    manifests: tuple[PublishedManifest, ...]
+    trusted_assets: frozenset[tuple[str, int, str]]
+
+    @property
+    def identities(self) -> tuple[ManifestIdentity, ...]:
+        return tuple(item.identity for item in self.manifests)
+
+
+@dataclasses.dataclass(frozen=True)
+class TargetCertification:
+    id: int
+    uuid: str
+    name: str
+    size: int
+    sha256: str
+
+
+EMPTY_PUBLISHED_STATE = PublishedState((), frozenset())
 
 
 def normalize_sha256(value: Any, field: str) -> str:
@@ -109,6 +139,70 @@ def validate_asset_name(value: Any, field: str = "assetName") -> str:
     ):
         raise MirrorError(f"{field} contains unsafe characters: {value!r}")
     return value
+
+
+def normalize_target_uuid(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise MirrorError(f"{field} must contain an attachment UUID")
+    try:
+        normalized = str(uuid.UUID(value))
+    except (ValueError, AttributeError) as exc:
+        raise MirrorError(f"{field} is not a valid attachment UUID") from exc
+    if value.lower() != normalized:
+        raise MirrorError(f"{field} must use canonical UUID form")
+    return normalized
+
+
+def uuid_bound_download_url(asset: TargetAsset) -> str:
+    """Return an anonymous URL that is cryptographically bound to one asset.
+
+    A name-based Release URL is ambiguous while Gitea temporarily contains two
+    canonical names.  Gitea's attachment API exposes a UUID specifically for
+    the stored object, so every destructive decision requires that UUID to be
+    present in the public URL returned by the API.
+    """
+
+    asset_uuid = normalize_target_uuid(
+        asset.uuid, f"Gitea attachment {asset.id} UUID"
+    )
+    parsed = urllib.parse.urlsplit(asset.download_url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise MirrorError(
+            f"Gitea attachment {asset.id} has no safe UUID-bound HTTPS URL"
+        )
+    expected_suffix = f"/attachments/{asset_uuid}"
+    if not parsed.path.endswith(expected_suffix):
+        raise MirrorError(
+            f"Gitea attachment {asset.id} download URL is not bound to UUID "
+            f"{asset_uuid}"
+        )
+    return asset.download_url
+
+
+def require_unique_target_identities(assets: Iterable[TargetAsset]) -> None:
+    """Reject aliases before any cleanup can act on attachment IDs."""
+
+    seen_ids: set[int] = set()
+    seen_uuids: set[str] = set()
+    seen_urls: set[str] = set()
+    for asset in assets:
+        url = uuid_bound_download_url(asset)
+        if asset.id in seen_ids:
+            raise MirrorError(f"duplicate Gitea attachment ID {asset.id}")
+        if asset.uuid in seen_uuids:
+            raise MirrorError(f"duplicate Gitea attachment UUID {asset.uuid}")
+        if url in seen_urls:
+            raise MirrorError(f"duplicate Gitea attachment download URL {url}")
+        seen_ids.add(asset.id)
+        seen_uuids.add(asset.uuid)
+        seen_urls.add(url)
 
 
 def normalize_size(value: Any, field: str) -> int:
@@ -236,7 +330,30 @@ def package_spec(package: Mapping[str, Any], field: str) -> AssetSpec:
     )
 
 
-def collect_manifest_assets(manifest: Mapping[str, Any]) -> dict[str, AssetSpec]:
+def validate_package_namespace(
+    name: str, *, mutable_names: Sequence[str]
+) -> None:
+    folded = name.casefold()
+    for mutable_name in mutable_names:
+        mutable = mutable_name.casefold()
+        if folded == mutable or any(
+            folded.startswith(f"{mutable}.{namespace}-")
+            for namespace in ("pending", "previous", "failed")
+        ):
+            raise MirrorError(
+                f"manifest package {name!r} uses reserved mutable namespace "
+                f"{mutable_name!r}"
+            )
+
+
+def collect_manifest_assets(
+    manifest: Mapping[str, Any],
+    *,
+    mutable_names: Sequence[str] = (
+        DEFAULT_MANIFEST_NAME,
+        DEFAULT_LAUNCHER_NAME,
+    ),
+) -> dict[str, AssetSpec]:
     """Return all package assets supported by this manifest.
 
     The current direct transition remains represented by the top-level
@@ -248,7 +365,9 @@ def collect_manifest_assets(manifest: Mapping[str, Any]) -> dict[str, AssetSpec]
     result: dict[str, AssetSpec] = {}
     for field in PACKAGE_FIELDS:
         for index, package in enumerate(as_object_list(manifest.get(field), field)):
-            add_spec(result, package_spec(package, f"{field}[{index}]"))
+            spec = package_spec(package, f"{field}[{index}]")
+            validate_package_namespace(spec.name, mutable_names=mutable_names)
+            add_spec(result, spec)
 
     transitions = as_object_list(manifest.get("deltaTransitions"), "deltaTransitions")
     if len(transitions) > 128:
@@ -258,9 +377,11 @@ def collect_manifest_assets(manifest: Mapping[str, Any]) -> dict[str, AssetSpec]
         for package_index, package in enumerate(
             as_object_list(transition.get("packages"), packages_field)
         ):
+            spec = package_spec(package, f"{packages_field}[{package_index}]")
+            validate_package_namespace(spec.name, mutable_names=mutable_names)
             add_spec(
                 result,
-                package_spec(package, f"{packages_field}[{package_index}]"),
+                spec,
             )
     return result
 
@@ -288,6 +409,27 @@ def ordered_specs(
     values.append(launcher)
     values.append(manifest)
     return values
+
+
+def planned_action(
+    spec: AssetSpec,
+    current: Sequence[TargetAsset],
+    *,
+    mutable: bool,
+    verify_existing_sha: bool,
+    trusted_assets: frozenset[tuple[str, int, str]],
+) -> str:
+    if not current:
+        return "stage-verify-publish" if mutable else "upload"
+    if mutable:
+        return "verify-or-reconcile"
+    if len(current) > 1 or current[0].size != spec.size:
+        return "conflict"
+    if verify_existing_sha:
+        return "verify"
+    if asset_trust_key(spec) not in trusted_assets:
+        return "verify-untrusted"
+    return "reuse-certified"
 
 
 def split_repo(value: str, field: str) -> tuple[str, str]:
@@ -606,23 +748,55 @@ class GiteaReleaseClient:
             raise MirrorError("Gitea write operation requires the configured token")
         return self.token
 
-    @staticmethod
-    def release_assets(release: Mapping[str, Any]) -> TargetAssets:
+    def _target_asset_from_record(
+        self, raw: Mapping[str, Any], field: str
+    ) -> TargetAsset:
+        try:
+            asset_id = int(raw["id"])
+            if asset_id <= 0:
+                raise ValueError("attachment ID must be positive")
+            asset_uuid = normalize_target_uuid(raw.get("uuid"), f"{field}.uuid")
+            name = validate_asset_name(raw.get("name"), f"{field}.name")
+            size = normalize_size(raw.get("size"), f"{field}.size")
+            raw_url = str(raw.get("browser_download_url") or "")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MirrorError(f"{field} is invalid") from exc
+
+        parsed = urllib.parse.urlsplit(raw_url)
+        base = urllib.parse.urlsplit(self.base_url)
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc != base.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise MirrorError(
+                f"{field}.browser_download_url is not a safe URL on the Gitea origin"
+            )
+
+        # Gitea's browser_download_url is normally the consumer-facing
+        # tag/name route and therefore aliases duplicate names.  Build the
+        # documented UUID route ourselves for per-attachment verification.
+        download_url = f"{self.base_url}/attachments/{asset_uuid}"
+        return TargetAsset(asset_id, asset_uuid, name, size, download_url)
+
+    def release_assets(self, release: Mapping[str, Any]) -> TargetAssets:
         result: TargetAssets = {}
         raw_assets = release.get("assets") or []
         if not isinstance(raw_assets, list):
             raise MirrorError("Gitea release assets field is invalid")
-        for raw in raw_assets:
+        flat: list[TargetAsset] = []
+        for index, raw in enumerate(raw_assets):
             if not isinstance(raw, Mapping):
                 raise MirrorError("Gitea release contains an invalid asset record")
-            name = validate_asset_name(raw.get("name"), "Gitea asset name")
-            asset = TargetAsset(
-                id=int(raw["id"]),
-                name=name,
-                size=int(raw["size"]),
-                download_url=str(raw.get("browser_download_url") or ""),
+            asset = self._target_asset_from_record(
+                raw, f"Gitea release asset[{index}]"
             )
-            result.setdefault(name, []).append(asset)
+            flat.append(asset)
+            result.setdefault(asset.name, []).append(asset)
+        require_unique_target_identities(flat)
         for assets in result.values():
             assets.sort(key=lambda item: item.id)
         return result
@@ -680,13 +854,10 @@ class GiteaReleaseClient:
             )
         try:
             raw = json.loads(payload)
-            uploaded = TargetAsset(
-                id=int(raw["id"]),
-                name=validate_asset_name(raw["name"], "uploaded asset name"),
-                size=int(raw["size"]),
-                download_url=str(raw["browser_download_url"]),
-            )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            if not isinstance(raw, Mapping):
+                raise TypeError("attachment response root is not an object")
+            uploaded = self._target_asset_from_record(raw, "uploaded asset")
+        except (TypeError, json.JSONDecodeError) as exc:
             raise MirrorError("Gitea upload returned an invalid attachment record") from exc
         if uploaded.name != target_name or uploaded.size != size:
             raise MirrorError(
@@ -709,15 +880,7 @@ class GiteaReleaseClient:
         )
         if not isinstance(raw, Mapping):
             raise MirrorError("Gitea rename response is invalid")
-        try:
-            renamed = TargetAsset(
-                id=int(raw["id"]),
-                name=validate_asset_name(raw["name"], "renamed asset name"),
-                size=int(raw["size"]),
-                download_url=str(raw["browser_download_url"]),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise MirrorError("Gitea rename response is invalid") from exc
+        renamed = self._target_asset_from_record(raw, "renamed asset")
         if renamed.id != asset_id or renamed.name != name:
             raise MirrorError(
                 f"Gitea rename metadata mismatch for attachment {asset_id}: "
@@ -747,11 +910,50 @@ def target_by_id(assets: TargetAssets, asset_id: int) -> TargetAsset | None:
     return None
 
 
-def target_with_prefix(assets: TargetAssets, prefix: str) -> list[TargetAsset]:
+def all_target_assets(assets: TargetAssets) -> list[TargetAsset]:
+    return sorted(
+        (asset for candidates in assets.values() for asset in candidates),
+        key=lambda item: item.id,
+    )
+
+
+def pending_transaction_candidates(
+    assets: TargetAssets, spec: AssetSpec
+) -> list[TargetAsset]:
+    pattern = re.compile(
+        rf"^{re.escape(spec.name)}\.pending-{re.escape(spec.sha256[:12])}-"
+        r"[1-9]\d*-[0-9a-f]{6}$"
+    )
+    return sorted(
+        (
+            asset
+            for name, candidates in assets.items()
+            if pattern.fullmatch(name)
+            for asset in candidates
+        ),
+        key=lambda item: item.id,
+    )
+
+
+def previous_transaction_candidates(
+    assets: TargetAssets, canonical_name: str
+) -> list[TargetAsset]:
+    pattern = re.compile(
+        rf"^{re.escape(canonical_name)}\.previous-(?P<id>[1-9]\d*)-"
+        r"[0-9a-f]{12}-[1-9]\d*-[0-9a-f]{6}$"
+    )
     result: list[TargetAsset] = []
     for name, candidates in assets.items():
-        if name.startswith(prefix):
-            result.extend(candidates)
+        match = pattern.fullmatch(name)
+        if match is None:
+            continue
+        for asset in candidates:
+            if int(match.group("id")) != asset.id:
+                raise MirrorError(
+                    f"legacy transaction checkpoint {name!r} does not match "
+                    f"attachment ID {asset.id}"
+                )
+            result.append(asset)
     return sorted(result, key=lambda item: item.id)
 
 
@@ -776,12 +978,10 @@ def refresh_after_ambiguous_write(
 
 
 def verify_public_target(asset: TargetAsset, spec: AssetSpec, temp_root: Path) -> None:
-    if not asset.download_url.startswith("https://"):
-        raise MirrorError(f"Gitea attachment {asset.name} has no public HTTPS URL")
     destination = temp_root / f"verify-{asset.id}-{spec.name}"
     try:
         download_file(
-            asset.download_url,
+            uuid_bound_download_url(asset),
             destination,
             expected_size=spec.size,
             expected_sha256=spec.sha256,
@@ -811,32 +1011,29 @@ def verify_public_canonical(
 def published_manifest_candidates(
     assets: TargetAssets, manifest_name: str
 ) -> list[TargetAsset]:
-    canonical = target_candidates(assets, manifest_name)
-    if canonical:
-        return canonical
-    # The superseded old->previous swap could crash after removing the
-    # canonical name.  That previous ID is still the published checkpoint and
-    # must participate in rollback checks before sync restores its name.
-    previous = target_with_prefix(assets, f"{manifest_name}.previous-")
-    if len(previous) > 1:
-        raise MirrorError(
-            "cannot identify the published manifest: multiple previous IDs exist"
-        )
-    return previous
+    # Canonical attachments and every *exactly parsed* checkpoint from the
+    # superseded old->previous protocol are publication history.  A canonical
+    # must not hide a higher dev.N checkpoint left by a crashed transaction.
+    candidates = target_candidates(assets, manifest_name)
+    candidates.extend(previous_transaction_candidates(assets, manifest_name))
+    by_id = {asset.id: asset for asset in candidates}
+    return sorted(by_id.values(), key=lambda item: item.id)
 
 
-def load_published_manifest_identities(
-    assets: TargetAssets, manifest_name: str, temp_root: Path
-) -> list[ManifestIdentity]:
+def load_published_state(
+    client: GiteaReleaseClient,
+    assets: TargetAssets,
+    manifest_name: str,
+    launcher_name: str,
+    temp_root: Path,
+) -> PublishedState:
     candidates = published_manifest_candidates(assets, manifest_name)
     if len(candidates) > 8:
-        raise MirrorError("target contains too many canonical manifest attachments")
-    result: list[ManifestIdentity] = []
+        raise MirrorError("target contains too many published manifest checkpoints")
+    require_unique_target_identities(candidates)
+    manifests: list[PublishedManifest] = []
+    trusted_by_name: dict[str, tuple[int, str]] = {}
     for asset in candidates:
-        if not asset.download_url.startswith("https://"):
-            raise MirrorError(
-                f"published manifest attachment {asset.id} has no public HTTPS URL"
-            )
         if asset.size <= 0 or asset.size > MAX_PUBLISHED_MANIFEST_BYTES:
             raise MirrorError(
                 f"published manifest attachment {asset.id} has unsafe size {asset.size}"
@@ -844,7 +1041,7 @@ def load_published_manifest_identities(
         destination = temp_root / f"published-manifest-{asset.id}.json"
         try:
             _, digest = download_file(
-                asset.download_url,
+                uuid_bound_download_url(asset),
                 destination,
                 expected_size=asset.size,
                 expected_sha256=None,
@@ -859,12 +1056,38 @@ def load_published_manifest_identities(
                 raise MirrorError(
                     f"published manifest attachment {asset.id} root is not an object"
                 )
-            result.append(
-                manifest_identity(raw, digest, f"published manifest {asset.id}")
+            packages = tuple(
+                collect_manifest_assets(
+                    raw, mutable_names=(manifest_name, launcher_name)
+                ).values()
+            )
+            for package in packages:
+                value = (package.size, package.sha256)
+                previous = trusted_by_name.get(package.name)
+                if previous is not None and previous != value:
+                    raise MirrorError(
+                        "published manifest checkpoints conflict for immutable "
+                        f"asset {package.name!r}"
+                    )
+                trusted_by_name[package.name] = value
+            manifests.append(
+                PublishedManifest(
+                    asset=asset,
+                    identity=manifest_identity(
+                        raw, digest, f"published manifest {asset.id}"
+                    ),
+                    packages=packages,
+                )
             )
         finally:
             destination.unlink(missing_ok=True)
-    return result
+    return PublishedState(
+        manifests=tuple(manifests),
+        trusted_assets=frozenset(
+            (name, size, digest)
+            for name, (size, digest) in trusted_by_name.items()
+        ),
+    )
 
 
 def download_source(
@@ -878,6 +1101,58 @@ def download_source(
         expected_sha256=spec.sha256,
     )
     return destination
+
+
+def asset_trust_key(spec: AssetSpec) -> tuple[str, int, str]:
+    return (spec.name, spec.size, spec.sha256)
+
+
+def certify_target(
+    certifications: MutableMapping[str, TargetCertification],
+    asset: TargetAsset,
+    spec: AssetSpec,
+) -> None:
+    uuid_bound_download_url(asset)
+    if asset.name != spec.name or asset.size != spec.size:
+        raise MirrorError(
+            f"cannot certify attachment {asset.id}: metadata differs from {spec.name}"
+        )
+    certifications[spec.name] = TargetCertification(
+        id=asset.id,
+        uuid=asset.uuid,
+        name=asset.name,
+        size=asset.size,
+        sha256=spec.sha256,
+    )
+
+
+def require_certified_targets(
+    assets: TargetAssets,
+    specs: Sequence[AssetSpec],
+    certifications: Mapping[str, TargetCertification],
+) -> None:
+    """Bind the pre-manifest gate to the exact IDs previously certified."""
+
+    require_unique_target_identities(all_target_assets(assets))
+    for spec in specs:
+        candidates = target_candidates(assets, spec.name)
+        certificate = certifications.get(spec.name)
+        if len(candidates) != 1 or certificate is None:
+            raise MirrorError(
+                f"pre-manifest gate failed: {spec.name} lacks one certified target ID"
+            )
+        target = candidates[0]
+        expected = TargetCertification(
+            id=target.id,
+            uuid=target.uuid,
+            name=target.name,
+            size=target.size,
+            sha256=spec.sha256,
+        )
+        if certificate != expected or target.size != spec.size:
+            raise MirrorError(
+                f"pre-manifest gate failed: certification changed for {spec.name}"
+            )
 
 
 def upload_with_reconciliation(
@@ -900,7 +1175,9 @@ def upload_with_reconciliation(
             except Exception:
                 assets = {}
             verified = []
-            for candidate in target_candidates(assets, target_name):
+            candidates = target_candidates(assets, target_name)
+            require_unique_target_identities(candidates)
+            for candidate in candidates:
                 if candidate.size != spec.size:
                     continue
                 try:
@@ -933,7 +1210,12 @@ def rename_with_reconciliation(
     name: str,
 ) -> TargetAsset:
     try:
-        return client.rename(release_id, asset.id, name)
+        renamed = client.rename(release_id, asset.id, name)
+        if renamed.uuid != asset.uuid or renamed.size != asset.size:
+            raise MirrorError(
+                f"Gitea rename changed attachment identity for {asset.id}"
+            )
+        return renamed
     except Exception as rename_error:
         current: TargetAsset | None = None
         for attempt in range(3):
@@ -946,6 +1228,7 @@ def rename_with_reconciliation(
                 current is not None
                 and current.name == name
                 and current.size == asset.size
+                and current.uuid == asset.uuid
             ):
                 print(
                     f"reconciled rename after ambiguous response: {asset.id} -> {name}",
@@ -1002,7 +1285,7 @@ def reconcile_legacy_previous(
 
     if target_candidates(assets, spec.name):
         return assets
-    previous = target_with_prefix(assets, f"{spec.name}.previous-")
+    previous = previous_transaction_candidates(assets, spec.name)
     if not previous:
         return assets
     if len(previous) != 1:
@@ -1025,9 +1308,8 @@ def reconcile_legacy_previous(
 def verified_pending_asset(
     assets: TargetAssets, spec: AssetSpec, temp_root: Path
 ) -> TargetAsset | None:
-    prefix = f"{spec.name}.pending-{spec.sha256[:12]}-"
     verified: list[TargetAsset] = []
-    for candidate in target_with_prefix(assets, prefix):
+    for candidate in pending_transaction_candidates(assets, spec):
         if candidate.size != spec.size:
             continue
         try:
@@ -1035,7 +1317,12 @@ def verified_pending_asset(
         except MirrorError:
             continue
         verified.append(candidate)
-    return max(verified, key=lambda item: item.id) if verified else None
+    if len(verified) > 1:
+        raise MirrorError(
+            f"multiple verified pending transactions exist for {spec.name}; "
+            "refusing to guess ownership"
+        )
+    return verified[0] if verified else None
 
 
 def replace_mutable_attachment(
@@ -1047,8 +1334,9 @@ def replace_mutable_attachment(
     source_path: Path | None,
     spec: AssetSpec,
     temp_root: Path,
+    cleanup_authorized: bool,
     staged: TargetAsset | None = None,
-) -> None:
+) -> TargetAsset:
     """Publish a mutable asset without ever removing the prior canonical name.
 
     Gitea permits duplicate attachment names.  The new bytes are therefore
@@ -1057,8 +1345,10 @@ def replace_mutable_attachment(
     deleted.  A timeout after a successful mutation is reconciled by ID.
     """
 
+    require_unique_target_identities(existing)
     suffix = f"{spec.sha256[:12]}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
     pending_name = validate_asset_name(f"{spec.name}.pending-{suffix}")
+    current_transaction = staged is None
     if staged is None:
         if source_path is None:
             raise MirrorError(f"no source file is available for {spec.name}")
@@ -1075,22 +1365,27 @@ def replace_mutable_attachment(
         pending = staged
         pending_name = staged.name
         print(f"reusing verified staged attachment: {pending.name}")
+    require_unique_target_identities([*existing, pending])
     try:
         verify_public_target(pending, spec, temp_root)
     except Exception:
-        try:
-            delete_with_reconciliation(
-                client=client,
-                release_id=release_id,
-                tag=tag,
-                asset=pending,
-            )
-        except Exception as cleanup_error:
-            print(
-                f"WARNING: failed staged upload {pending.id} could not be removed: "
-                f"{cleanup_error}",
-                file=sys.stderr,
-            )
+        # Only the exact ID returned/reconciled for this invocation is owned by
+        # this transaction.  A staged ID discovered on a rerun is left intact
+        # when its re-verification fails; prefix-shaped names are not ownership.
+        if current_transaction and cleanup_authorized:
+            try:
+                delete_with_reconciliation(
+                    client=client,
+                    release_id=release_id,
+                    tag=tag,
+                    asset=pending,
+                )
+            except Exception as cleanup_error:
+                print(
+                    f"WARNING: failed staged upload {pending.id} could not be removed: "
+                    f"{cleanup_error}",
+                    file=sys.stderr,
+                )
         raise
 
     try:
@@ -1115,6 +1410,13 @@ def replace_mutable_attachment(
     # The same UUID-backed bytes were already verified while staged.  Recheck
     # them after the rename before retiring any previous canonical ID.
     verify_public_target(canonical_new, spec, temp_root)
+    if not cleanup_authorized and any(
+        previous.id != canonical_new.id for previous in existing
+    ):
+        raise MirrorError(
+            f"refusing cleanup for {spec.name} without a successful progression guard"
+        )
+    require_unique_target_identities([*existing, canonical_new])
     for previous in existing:
         if previous.id == canonical_new.id:
             continue
@@ -1126,21 +1428,13 @@ def replace_mutable_attachment(
         )
 
     assets = refresh_after_ambiguous_write(client, tag)
-    for stale in (
-        target_with_prefix(assets, f"{spec.name}.previous-")
-        + target_with_prefix(
-            assets, f"{spec.name}.pending-{spec.sha256[:12]}-"
-        )
-    ):
-        delete_with_reconciliation(
-            client=client,
-            release_id=release_id,
-            tag=tag,
-            asset=stale,
-        )
-    assets = refresh_after_ambiguous_write(client, tag)
     final = target_by_id(assets, canonical_new.id)
-    if final is None or final.name != spec.name or final.size != spec.size:
+    if (
+        final is None
+        or final.name != spec.name
+        or final.size != spec.size
+        or final.uuid != canonical_new.uuid
+    ):
         raise MirrorError(
             f"post-switch gate failed for {spec.name}: new canonical ID is missing"
         )
@@ -1153,6 +1447,7 @@ def replace_mutable_attachment(
         )
     verify_public_target(final, spec, temp_root)
     verify_public_canonical(client, tag, spec, temp_root)
+    return final
 
 
 def sync_asset(
@@ -1166,7 +1461,11 @@ def sync_asset(
     tag: str,
     existing_assets: TargetAssets,
     temp_root: Path,
+    trusted_assets: frozenset[tuple[str, int, str]],
+    certifications: MutableMapping[str, TargetCertification],
+    cleanup_authorized: bool,
 ) -> str:
+    require_unique_target_identities(all_target_assets(existing_assets))
     if mutable:
         existing_assets = reconcile_legacy_previous(
             client=client,
@@ -1192,6 +1491,12 @@ def sync_asset(
         if verified:
             keeper = max(verified, key=lambda item: item.id)
             extras = [item for item in candidates if item.id != keeper.id]
+            if extras and not cleanup_authorized:
+                raise MirrorError(
+                    f"refusing cleanup for {spec.name} without a successful "
+                    "progression guard"
+                )
+            require_unique_target_identities([keeper, *extras])
             for extra in extras:
                 delete_with_reconciliation(
                     client=client,
@@ -1212,32 +1517,24 @@ def sync_asset(
                 )
             verify_public_target(current, spec, temp_root)
             verify_public_canonical(client, tag, spec, temp_root)
-            for stale in target_with_prefix(
-                refreshed, f"{spec.name}.previous-"
-            ) + target_with_prefix(
-                refreshed, f"{spec.name}.pending-{spec.sha256[:12]}-"
-            ):
-                delete_with_reconciliation(
-                    client=client,
-                    release_id=release_id,
-                    tag=tag,
-                    asset=stale,
-                )
+            certify_target(certifications, current, spec)
             print(f"verified existing: {spec.name}")
             return "reconciled-existing" if extras else "verified-existing"
 
     existing = candidates[0] if candidates else None
     if not mutable and existing is not None and existing.size == spec.size:
-        if verify_existing_sha:
+        inherited_trust = asset_trust_key(spec) in trusted_assets
+        if verify_existing_sha or not inherited_trust:
             verify_public_target(existing, spec, temp_root)
+            certify_target(certifications, existing, spec)
             print(f"verified existing: {spec.name}")
             return "verified-existing"
         else:
-            # Immutable package filenames are content/version specific.  A first
-            # bootstrap should use --verify-existing-sha; later jobs may trust
-            # the size of assets that a previous successful job verified.
-            print(f"reused immutable asset by name/size: {spec.name}")
-            return "reused-existing"
+            # The exact name/size/SHA triple is inherited from a fully parsed,
+            # UUID-downloaded target manifest, then bound here to one target ID.
+            certify_target(certifications, existing, spec)
+            print(f"reused certified immutable asset: {spec.name}")
+            return "certified-existing"
     elif not mutable and existing is not None:
         raise MirrorError(
             f"immutable Gitea asset {spec.name} has size {existing.size}; "
@@ -1252,7 +1549,7 @@ def sync_asset(
     source_path = None if staged is not None else download_source(source, spec, temp_root)
     try:
         if mutable:
-            replace_mutable_attachment(
+            final = replace_mutable_attachment(
                 client=client,
                 release_id=release_id,
                 tag=tag,
@@ -1261,7 +1558,9 @@ def sync_asset(
                 spec=spec,
                 temp_root=temp_root,
                 staged=staged,
+                cleanup_authorized=cleanup_authorized,
             )
+            certify_target(certifications, final, spec)
             outcome = "replaced" if candidates else "uploaded"
             print(f"{outcome} and verified: {spec.name}")
             return outcome
@@ -1279,6 +1578,7 @@ def sync_asset(
                 temp_root=temp_root,
             )
             verify_public_target(uploaded, spec, temp_root)
+            certify_target(certifications, uploaded, spec)
         except Exception:
             if uploaded is not None:
                 try:
@@ -1401,7 +1701,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         version = source_identity.version
         content_hash = source_identity.content_hash
 
-        package_specs = collect_manifest_assets(manifest)
+        package_specs = collect_manifest_assets(
+            manifest, mutable_names=(manifest_name, launcher_name)
+        )
         for spec in package_specs.values():
             source_client.require(spec)
         manifest_spec = AssetSpec(
@@ -1456,35 +1758,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         target_assets = (
             target_client.release_assets(target_release) if target_release else {}
         )
-        published_identities = load_published_manifest_identities(
-            target_assets, manifest_name, temp_root
+        published_state = load_published_state(
+            target_client,
+            target_assets,
+            manifest_name,
+            launcher_name,
+            temp_root,
         )
         progression = validate_manifest_progression(
             source_identity,
-            published_identities,
+            published_state.identities,
             allow_rollback=allow_rollback,
         )
-        bootstrap_sha_verification = not published_identities
+        bootstrap_sha_verification = not published_state.manifests
         verify_existing_sha = effective_existing_sha_verification(
             requested=args.verify_existing_sha,
             probe=args.probe_largest_full,
-            published_manifest_count=len(published_identities),
+            published_manifest_count=len(published_state.manifests),
         )
 
         actions: list[dict[str, Any]] = []
         for spec in specs:
             current = target_candidates(target_assets, spec.name)
             mutable = spec.kind in {"launcher", "manifest-last"}
-            if not current:
-                action = "stage-verify-publish" if mutable else "upload"
-            elif mutable:
-                action = "verify-or-reconcile"
-            elif len(current) > 1 or current[0].size != spec.size:
-                action = "conflict"
-            elif verify_existing_sha:
-                action = "verify"
-            else:
-                action = "reuse-by-name-size"
+            action = planned_action(
+                spec,
+                current,
+                mutable=mutable,
+                verify_existing_sha=verify_existing_sha,
+                trusted_assets=published_state.trusted_assets,
+            )
             actions.append(
                 {
                     "name": spec.name,
@@ -1509,7 +1812,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "tag": args.gitea_tag,
                 "releaseExists": target_release is not None,
                 "publishedVersions": [
-                    item.version for item in published_identities
+                    item.version for item in published_state.identities
                 ],
             },
             "version": version,
@@ -1547,6 +1850,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             target_release = target_client.create_release(args.gitea_tag, version)
         release_id = int(target_release["id"])
         results: list[dict[str, Any]] = []
+        certifications: dict[str, TargetCertification] = {}
 
         if args.probe_largest_full:
             probe_spec = specs[0]
@@ -1561,15 +1865,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 tag=args.gitea_tag,
                 existing_assets=target_assets,
                 temp_root=temp_root,
+                trusted_assets=published_state.trusted_assets,
+                certifications=certifications,
+                cleanup_authorized=True,
             )
             results.append({"name": probe_spec.name, "result": probe_result})
             _, final_assets = target_client.refresh_assets(args.gitea_tag)
             final_probe_candidates = target_candidates(final_assets, probe_spec.name)
-            if (
-                len(final_probe_candidates) != 1
-                or final_probe_candidates[0].size != probe_spec.size
-            ):
-                raise MirrorError("large-upload probe asset is absent or has wrong size")
+            require_certified_targets(
+                final_assets, [probe_spec], certifications
+            )
             final_probe = final_probe_candidates[0]
             verify_public_target(final_probe, probe_spec, temp_root)
             receipt = {
@@ -1601,14 +1906,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         for spec in specs[:-1]:
             _, target_assets = target_client.refresh_assets(args.gitea_tag)
             if spec.kind == "launcher":
-                latest_published = load_published_manifest_identities(
-                    target_assets, manifest_name, temp_root
+                latest_state = load_published_state(
+                    target_client,
+                    target_assets,
+                    manifest_name,
+                    launcher_name,
+                    temp_root,
                 )
                 progression = validate_manifest_progression(
                     source_identity,
-                    latest_published,
+                    latest_state.identities,
                     allow_rollback=allow_rollback,
                 )
+            else:
+                latest_state = published_state
             source = source_client.require(spec)
             result = sync_asset(
                 spec=spec,
@@ -1620,24 +1931,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                 tag=args.gitea_tag,
                 existing_assets=target_assets,
                 temp_root=temp_root,
+                trusted_assets=latest_state.trusted_assets,
+                certifications=certifications,
+                cleanup_authorized=True,
             )
             results.append({"name": spec.name, "result": result})
 
         _, target_assets = target_client.refresh_assets(args.gitea_tag)
-        for spec in specs[:-1]:
-            target = target_candidates(target_assets, spec.name)
-            if len(target) != 1 or target[0].size != spec.size:
-                raise MirrorError(
-                    f"pre-manifest gate failed: {spec.name} is absent or has wrong size"
-                )
+        require_certified_targets(
+            target_assets, specs[:-1], certifications
+        )
 
         _, target_assets = target_client.refresh_assets(args.gitea_tag)
-        latest_published = load_published_manifest_identities(
-            target_assets, manifest_name, temp_root
+        latest_state = load_published_state(
+            target_client,
+            target_assets,
+            manifest_name,
+            launcher_name,
+            temp_root,
         )
         progression = validate_manifest_progression(
             source_identity,
-            latest_published,
+            latest_state.identities,
             allow_rollback=allow_rollback,
         )
         manifest_result = sync_asset(
@@ -1650,6 +1965,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             tag=args.gitea_tag,
             existing_assets=target_assets,
             temp_root=temp_root,
+            trusted_assets=latest_state.trusted_assets,
+            certifications=certifications,
+            cleanup_authorized=True,
         )
         results.append({"name": manifest_spec.name, "result": manifest_result})
 
