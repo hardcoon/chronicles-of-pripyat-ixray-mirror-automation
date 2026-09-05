@@ -11,13 +11,50 @@ tag `dev-2026.08.26.1`. The permanent Gitea target is the Release tag
 `dev-channel` in `hardcoon/chronicles-of-pripyat-ixray-downloads`; it does not
 change when the manifest version changes.
 
-The script mirrors only:
+The script mirrors only the current manifest-selected payload:
 
 - every asset in top-level `fullPackages`, `deltaPackages` and
   `initialPackages`;
 - every supported historical delta in `deltaTransitions[*].packages`;
 - `ChroniclesLauncher.exe`;
-- `manifest-dev.json`, strictly last.
+- a Gitea-derived `manifest-dev.json`, strictly last.
+
+The GitHub ZIP files and canonical GitHub manifest are never rewritten. Every
+logical package larger than 256 MiB is first downloaded and verified against
+its original size/SHA-256, then copied as deterministic contiguous raw-byte
+parts no larger than 256 MiB. Smaller packages remain direct attachments. The
+derived Gitea manifest retains every source field (including the original
+`schemaVersion`, `version`, `contentHash`, package names/sizes/hashes and delta
+chain) and adds only this transport description:
+
+```json
+{
+  "mirrorTransport": {
+    "schemaVersion": 1,
+    "segmentSize": 268435456,
+    "segmentedAssets": [
+      {
+        "assetName": "logical-package.zip",
+        "size": 123,
+        "sha256": "logical SHA-256",
+        "parts": [
+          {
+            "assetName": "deterministic part name",
+            "offset": 0,
+            "size": 123,
+            "sha256": "part SHA-256"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+A compatible launcher downloads parts in order, verifies every part, appends
+their raw bytes to the logical ZIP and finally verifies the reconstructed ZIP
+against the unchanged logical size/SHA-256 already present in the source
+manifest.
 
 Duplicate package names must have identical size and SHA-256. Source GitHub
 metadata, manifest size/SHA, the streamed local file, Gitea attachment size,
@@ -58,22 +95,29 @@ fails closed. Cleanup is enabled only after this complete checkpoint set has
 passed the progression guard. The workflow fixes all writes to the persistent
 source tag `dev-2026.08.26.1`; it has no manual `source_tag` write input.
 
-There is deliberately no sweep that deletes old, unreferenced, or otherwise
-"stale" Release assets. This matters because an older delta can still be a
-valid transition for an installed game. The only deletions performed by the
-script are narrowly transactional: the exact ID/UUID returned for its current
-failed temporary upload and the explicit previous canonical IDs captured by a
-replacement after the new UUID is verified. It does not delete temporary IDs
-merely because their names share `.pending-` or `.previous-` prefixes.
-Immutable ZIP packages and unrelated attachments are never deleted. Package
-names underneath launcher/manifest mutable namespaces are rejected by schema
-validation so package data can never be mistaken for transaction state.
+There is deliberately no prefix scan or general "stale asset" sweep. Every
+delta still present anywhere in the new manifest remains referenced and is
+therefore retained. Only after the new canonical manifest has passed anonymous
+UUID and name-route verification may the script prune an immutable attachment
+whose exact ID/name/size/SHA came from a fully parsed previous target manifest
+and whose name is absent from the new physical transport. Unreferenced orphan
+parts are not deleted. Transaction cleanup remains limited to exact IDs owned
+by the current mutable upload. Package names underneath launcher/manifest
+mutable namespaces are rejected so package data cannot be mistaken for
+transaction state.
 
-Transfers are sequential and use a single file per Gitea API request. A hosted
-GitHub Actions runner processes only one asset at a time. During anonymous
-post-upload verification its temporary disk can hold the source file plus one
-verification copy of that same asset, never the complete game. The author's PC
-neither downloads nor uploads the game:
+One separately narrow bootstrap repair handles the interrupted legacy probe:
+before any target manifest exists, exactly one attachment under an oversized
+logical ZIP name may be deleted only when it is strictly smaller than the
+canonical GitHub ZIP. A complete, oversized, duplicate, post-publication or
+otherwise ambiguous logical attachment fails closed or remains untouched.
+
+Transfers are sequential and use one part per Gitea API request. A hosted
+GitHub Actions runner processes only one logical ZIP at a time and deletes it
+before moving to the next. Splitting materializes at most one 256 MiB part;
+anonymous verification similarly downloads only that part. The complete game
+is never staged on the runner, and the author's PC neither downloads nor
+uploads it:
 
 ```text
 GitHub Release -> GitHub-hosted runner temporary disk -> Gitea Release
@@ -81,17 +125,19 @@ GitHub Release -> GitHub-hosted runner temporary disk -> Gitea Release
 
 Release attachments are sent through Gitea's documented raw
 `application/octet-stream` request form with the attachment name in the query
-string. The request uses HTTP/1.1 chunked transfer framing, matching Gitea's
-large-LFS transport and avoiding both the multipart parser/spool path and
-known-length request buffering for multi-gigabyte files. The decoded body is
-still the exact source ZIP and receives the same post-upload size/SHA-256
-verification.
+string. The request uses HTTP/1.1 chunked transfer framing and avoids both the
+multipart parser/spool path and known-length request buffering. The decoded
+body is an exact contiguous source-ZIP byte range and receives a full anonymous
+size/SHA-256 verification through its attachment UUID.
 
 The first bootstrap still has to transfer the current approximately 20.8 GB
 once between the services. Later runs reuse unchanged package attachments and
 transfer only new or replaced assets. Gitea's API does not provide resumable
-Release-attachment uploads, so an interrupted individual asset is retried from
-the beginning on the next run.
+Release-attachment uploads, so an interrupted part (at most 256 MiB) is retried
+from the beginning on the next run. A published transport map certifies exact
+unchanged parts, allowing later runs to reuse them without re-splitting the
+logical package. Explicit verification re-downloads/hashes the public parts,
+not the source ZIP.
 
 ## Authentication and one-time setup
 
@@ -156,16 +202,15 @@ exact order:
    Review the target tag (`dev-channel`), version, content hash, approximately
    20.8 GB total, and `manifestIsLast=true`.
 2. Set only `GITEA_MIRROR_WRITE_ENABLED=true`.
-3. Choose `operation=probe-largest-full` and
-   `verify_existing_sha=true`. This uploads and anonymously hashes just the
-   largest full package, but does **not** upload the launcher or manifest and
-   cannot activate the mirror. The selection is derived from the current
-   manifest. For manifest `2026.09.05-dev.29`, the expected probe is
-   `cop-2026.08.26-dev.1-full-03.zip`, 1,960,473,562 bytes, SHA-256
-   `c7be9dbbd3235bc1d59cff5a84c1a642db4bc1230e02f16fa83ffd4875f40d28`.
+3. Choose `operation=probe-first-segment` and
+   `verify_existing_sha=true`. This first verifies the complete largest source
+   ZIP, then uploads and anonymously hashes only its first transport part (at
+   most 268,435,456 bytes). It does **not** upload the launcher or manifest and
+   cannot activate the mirror. Selection and part naming are deterministic
+   from the current manifest.
 4. Inspect the probe receipt and anonymously download/check the resulting
-   canonical attachment. A successful probe remains in `dev-channel` and is
-   reused by the bootstrap, so those roughly 1.96 GB are not uploaded twice.
+   part attachment. A successful probe remains in `dev-channel` and is reused
+   by bootstrap, so those first 256 MiB are not uploaded twice.
    If the server returns HTTP 413 or the job times out, stop: the manifest is
    unchanged and no launcher can select an incomplete Gitea mirror.
 5. Choose `operation=mirror` and `verify_existing_sha=true`. Assets transfer
@@ -179,7 +224,7 @@ exact order:
 The workflow has one concurrency group and never cancels a run in progress,
 so two manifest switches cannot overlap. Scheduled writes require **both**
 variables. Manual `plan` remains available with neither variable. Manual
-`probe-largest-full` and `mirror` fail closed unless the write gate is true.
+`probe-first-segment` and `mirror` fail closed unless the write gate is true.
 
 There is deliberately no rollback control in the workflow. For a separately
 reviewed emergency recovery, direct script use requires both

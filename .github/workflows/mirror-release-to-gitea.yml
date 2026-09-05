@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Operation (run plan first)
+        description: Operation (plan, <=256 MiB segment probe, or mirror)
         required: true
         default: plan
         type: choice
         options:
           - plan
-          - probe-largest-full
+          - probe-first-segment
           - mirror
       verify_existing_sha:
         description: Download and hash every existing immutable package
@@ -77,7 +77,7 @@ jobs:
           )
           case "$operation" in
             plan|mirror) ;;
-            probe-largest-full) args+=(--probe-largest-full) ;;
+            probe-first-segment) args+=(--probe-largest-full) ;;
             *) echo "Unsupported operation: $operation" >&2; exit 2 ;;
           esac
           if [[ "$INPUT_VERIFY_EXISTING_SHA" == "true" ]]; then
@@ -148,7 +148,7 @@ jobs:
             --receipt-out "$RUNNER_TEMP/gitea-mirror-receipt.json"
           )
           case "$operation" in
-            probe-largest-full) args+=(--probe-largest-full) ;;
+            probe-first-segment) args+=(--probe-largest-full) ;;
             mirror) ;;
             *) echo "Unsupported operation: $operation" >&2; exit 2 ;;
           esac

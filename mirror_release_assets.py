@@ -15,6 +15,7 @@ developer workstation is not involved.
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import hashlib
 import http.client
@@ -47,6 +48,11 @@ DEFAULT_LAUNCHER_NAME = "ChroniclesLauncher.exe"
 ROLLBACK_GUARD_ENV = "GITEA_MIRROR_ROLLBACK_ENABLED"
 MAX_PUBLISHED_MANIFEST_BYTES = 32 * 1024 * 1024
 PACKAGE_FIELDS = ("fullPackages", "deltaPackages", "initialPackages")
+MIRROR_TRANSPORT_FIELD = "mirrorTransport"
+MIRROR_TRANSPORT_SCHEMA_VERSION = 1
+SEGMENT_SIZE_BYTES = 256 * 1024 * 1024
+MAX_SEGMENT_COUNT = 9999
+PLACEHOLDER_SHA256 = "0" * 64
 
 
 class MirrorError(RuntimeError):
@@ -116,6 +122,7 @@ class PublishedManifest:
 class PublishedState:
     manifests: tuple[PublishedManifest, ...]
     trusted_assets: frozenset[tuple[str, int, str]]
+    segmented_assets: tuple[SegmentedAsset, ...]
 
     @property
     def identities(self) -> tuple[ManifestIdentity, ...]:
@@ -131,7 +138,19 @@ class TargetCertification:
     sha256: str
 
 
-EMPTY_PUBLISHED_STATE = PublishedState((), frozenset())
+@dataclasses.dataclass(frozen=True)
+class SegmentPart:
+    spec: AssetSpec
+    offset: int
+
+
+@dataclasses.dataclass(frozen=True)
+class SegmentedAsset:
+    logical: AssetSpec
+    parts: tuple[SegmentPart, ...]
+
+
+EMPTY_PUBLISHED_STATE = PublishedState((), frozenset(), ())
 
 
 def normalize_sha256(value: Any, field: str) -> str:
@@ -408,6 +427,264 @@ def collect_manifest_assets(
                 spec,
             )
     return result
+
+
+def segment_layout(
+    logical: AssetSpec, *, part_sha256: Sequence[str] | None = None
+) -> tuple[SegmentPart, ...]:
+    """Return the deterministic v1 byte layout for one logical package."""
+
+    if logical.size <= SEGMENT_SIZE_BYTES:
+        raise MirrorError(
+            f"{logical.name} is not larger than the {SEGMENT_SIZE_BYTES}-byte "
+            "segmentation threshold"
+        )
+    count = (logical.size + SEGMENT_SIZE_BYTES - 1) // SEGMENT_SIZE_BYTES
+    if count > MAX_SEGMENT_COUNT:
+        raise MirrorError(
+            f"{logical.name} requires {count} parts; limit is {MAX_SEGMENT_COUNT}"
+        )
+    if part_sha256 is not None and len(part_sha256) != count:
+        raise MirrorError(
+            f"{logical.name} has {len(part_sha256)} part hashes; expected {count}"
+        )
+    result: list[SegmentPart] = []
+    for zero_index in range(count):
+        index = zero_index + 1
+        offset = zero_index * SEGMENT_SIZE_BYTES
+        size = min(SEGMENT_SIZE_BYTES, logical.size - offset)
+        name = validate_asset_name(
+            "cop-mirror-v1-"
+            f"{logical.sha256}-part-{index:04d}-of-{count:04d}.bin",
+            f"segment name for {logical.name}",
+        )
+        digest = (
+            normalize_sha256(
+                part_sha256[zero_index],
+                f"segment {index} SHA-256 for {logical.name}",
+            )
+            if part_sha256 is not None
+            else PLACEHOLDER_SHA256
+        )
+        result.append(
+            SegmentPart(
+                spec=AssetSpec(name, size, digest, f"segment:{logical.name}"),
+                offset=offset,
+            )
+        )
+    return tuple(result)
+
+
+def segmented_asset_json(segmented: SegmentedAsset) -> dict[str, Any]:
+    return {
+        "assetName": segmented.logical.name,
+        "size": segmented.logical.size,
+        "sha256": segmented.logical.sha256,
+        "parts": [
+            {
+                "assetName": part.spec.name,
+                "offset": part.offset,
+                "size": part.spec.size,
+                "sha256": part.spec.sha256,
+            }
+            for part in segmented.parts
+        ],
+    }
+
+
+def parse_mirror_transport(
+    manifest: Mapping[str, Any],
+    packages: Mapping[str, AssetSpec],
+    *,
+    mutable_names: Sequence[str] = (
+        DEFAULT_MANIFEST_NAME,
+        DEFAULT_LAUNCHER_NAME,
+    ),
+) -> tuple[SegmentedAsset, ...]:
+    """Validate and return the optional application-level mirror transport."""
+
+    value = manifest.get(MIRROR_TRANSPORT_FIELD)
+    if value is None:
+        return ()
+    if not isinstance(value, Mapping):
+        raise MirrorError(f"{MIRROR_TRANSPORT_FIELD} must be an object")
+    schema_version = value.get("schemaVersion")
+    if isinstance(schema_version, bool) or schema_version != 1:
+        raise MirrorError(
+            f"{MIRROR_TRANSPORT_FIELD}.schemaVersion must be "
+            f"{MIRROR_TRANSPORT_SCHEMA_VERSION}"
+        )
+    segment_size = value.get("segmentSize")
+    if isinstance(segment_size, bool) or segment_size != SEGMENT_SIZE_BYTES:
+        raise MirrorError(
+            f"{MIRROR_TRANSPORT_FIELD}.segmentSize must be {SEGMENT_SIZE_BYTES}"
+        )
+    entries = as_object_list(
+        value.get("segmentedAssets"),
+        f"{MIRROR_TRANSPORT_FIELD}.segmentedAssets",
+    )
+    if len(entries) > len(packages):
+        raise MirrorError("mirrorTransport contains more entries than packages")
+
+    result: list[SegmentedAsset] = []
+    seen_logical: set[str] = set()
+    physical_by_name: dict[str, AssetSpec] = {}
+    for entry_index, entry in enumerate(entries):
+        field = f"{MIRROR_TRANSPORT_FIELD}.segmentedAssets[{entry_index}]"
+        logical = AssetSpec(
+            name=validate_asset_name(entry.get("assetName"), f"{field}.assetName"),
+            size=normalize_size(entry.get("size"), f"{field}.size"),
+            sha256=normalize_sha256(entry.get("sha256"), f"{field}.sha256"),
+            kind="published-logical-package",
+        )
+        if logical.name in seen_logical:
+            raise MirrorError(f"{field}.assetName is duplicated")
+        seen_logical.add(logical.name)
+        canonical = packages.get(logical.name)
+        if canonical is None:
+            raise MirrorError(
+                f"{field} references package {logical.name!r} absent from the manifest"
+            )
+        if (canonical.size, canonical.sha256) != (logical.size, logical.sha256):
+            raise MirrorError(
+                f"{field} does not match the logical package size/SHA-256"
+            )
+        if logical.size <= SEGMENT_SIZE_BYTES:
+            raise MirrorError(
+                f"{field} segments a package that fits in one direct attachment"
+            )
+
+        raw_parts = as_object_list(entry.get("parts"), f"{field}.parts")
+        expected_layout = segment_layout(logical)
+        if len(raw_parts) != len(expected_layout):
+            raise MirrorError(
+                f"{field}.parts has {len(raw_parts)} entries; "
+                f"expected {len(expected_layout)}"
+            )
+        parts: list[SegmentPart] = []
+        for part_index, (raw_part, expected) in enumerate(
+            zip(raw_parts, expected_layout, strict=True)
+        ):
+            part_field = f"{field}.parts[{part_index}]"
+            offset_value = raw_part.get("offset")
+            if isinstance(offset_value, bool):
+                raise MirrorError(f"{part_field}.offset must be an integer")
+            try:
+                offset = int(offset_value)
+            except (TypeError, ValueError) as exc:
+                raise MirrorError(f"{part_field}.offset must be an integer") from exc
+            spec = AssetSpec(
+                name=validate_asset_name(
+                    raw_part.get("assetName"), f"{part_field}.assetName"
+                ),
+                size=normalize_size(raw_part.get("size"), f"{part_field}.size"),
+                sha256=normalize_sha256(
+                    raw_part.get("sha256"), f"{part_field}.sha256"
+                ),
+                kind=f"segment:{logical.name}",
+            )
+            validate_package_namespace(spec.name, mutable_names=mutable_names)
+            if (
+                spec.name != expected.spec.name
+                or spec.size != expected.spec.size
+                or offset != expected.offset
+            ):
+                raise MirrorError(
+                    f"{part_field} does not match the deterministic v1 layout"
+                )
+            if spec.name in packages:
+                raise MirrorError(
+                    f"{part_field}.assetName collides with a logical package"
+                )
+            add_spec(physical_by_name, spec)
+            parts.append(SegmentPart(spec=spec, offset=offset))
+        result.append(SegmentedAsset(logical=canonical, parts=tuple(parts)))
+
+    expected_segmented = {
+        spec.name for spec in packages.values() if spec.size > SEGMENT_SIZE_BYTES
+    }
+    if seen_logical != expected_segmented:
+        missing = sorted(expected_segmented - seen_logical)
+        extra = sorted(seen_logical - expected_segmented)
+        raise MirrorError(
+            "mirrorTransport must describe every and only oversized package; "
+            f"missing={missing}, extra={extra}"
+        )
+    return tuple(result)
+
+
+def physical_package_specs(
+    packages: Mapping[str, AssetSpec],
+    segmented: Sequence[SegmentedAsset],
+) -> dict[str, AssetSpec]:
+    segmented_names = {item.logical.name for item in segmented}
+    result: dict[str, AssetSpec] = {}
+    for logical in packages.values():
+        if logical.name not in segmented_names:
+            add_spec(result, logical)
+    for item in segmented:
+        for part in item.parts:
+            add_spec(result, part.spec)
+    return result
+
+
+def build_derived_manifest(
+    source_manifest: Mapping[str, Any],
+    packages: Mapping[str, AssetSpec],
+    segmented: Sequence[SegmentedAsset],
+) -> dict[str, Any]:
+    if MIRROR_TRANSPORT_FIELD in source_manifest:
+        raise MirrorError(
+            "canonical GitHub manifest already contains mirrorTransport; "
+            "refusing to overwrite source-owned metadata"
+        )
+    by_name = {item.logical.name: item for item in segmented}
+    expected = {
+        spec.name for spec in packages.values() if spec.size > SEGMENT_SIZE_BYTES
+    }
+    if set(by_name) != expected:
+        raise MirrorError(
+            "cannot build derived manifest before every oversized package has "
+            "a complete verified segment map"
+        )
+    derived = copy.deepcopy(dict(source_manifest))
+    derived[MIRROR_TRANSPORT_FIELD] = {
+        "schemaVersion": MIRROR_TRANSPORT_SCHEMA_VERSION,
+        "segmentSize": SEGMENT_SIZE_BYTES,
+        "segmentedAssets": [
+            segmented_asset_json(by_name[name])
+            for name in sorted(by_name, key=str.casefold)
+        ],
+    }
+    # Validate the exact document before it becomes the target commit record.
+    parse_mirror_transport(derived, packages)
+    return derived
+
+
+def serialize_manifest(manifest: Mapping[str, Any]) -> bytes:
+    return (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode(
+        "utf-8"
+    )
+
+
+def published_segment_for(
+    state: PublishedState, logical: AssetSpec
+) -> SegmentedAsset | None:
+    matches = [
+        item
+        for item in state.segmented_assets
+        if (
+            item.logical.name,
+            item.logical.size,
+            item.logical.sha256,
+        )
+        == (logical.name, logical.size, logical.sha256)
+    ]
+    if len(matches) > 1 and any(item != matches[0] for item in matches[1:]):
+        raise MirrorError(
+            f"published manifests conflict on segment map for {logical.name}"
+        )
+    return matches[0] if matches else None
 
 
 def largest_full_package(manifest: Mapping[str, Any]) -> AssetSpec:
@@ -813,11 +1090,8 @@ class GiteaReleaseClient:
         download_url = f"{self.base_url}/attachments/{asset_uuid}"
         return TargetAsset(asset_id, asset_uuid, name, size, download_url)
 
-    def release_assets(self, release: Mapping[str, Any]) -> TargetAssets:
+    def _group_asset_records(self, raw_assets: Sequence[Any]) -> TargetAssets:
         result: TargetAssets = {}
-        raw_assets = release.get("assets") or []
-        if not isinstance(raw_assets, list):
-            raise MirrorError("Gitea release assets field is invalid")
         flat: list[TargetAsset] = []
         for index, raw in enumerate(raw_assets):
             if not isinstance(raw, Mapping):
@@ -831,6 +1105,37 @@ class GiteaReleaseClient:
         for assets in result.values():
             assets.sort(key=lambda item: item.id)
         return result
+
+    def release_assets(self, release: Mapping[str, Any]) -> TargetAssets:
+        """Enumerate every attachment through Gitea's paginated endpoint.
+
+        The release object embeds an ``assets`` array, but hosted instances may
+        truncate that array.  A segmented mirror has more than one hundred
+        attachments, so publication gates must use the dedicated list API.
+        """
+
+        try:
+            release_id = int(release["id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MirrorError("Gitea release ID is invalid") from exc
+        if release_id <= 0:
+            raise MirrorError("Gitea release ID must be positive")
+        records: list[Any] = []
+        page_size = 50
+        for page in range(1, 101):
+            _, payload = request_json(
+                f"{self.api_root}/releases/{release_id}/assets?"
+                + urllib.parse.urlencode({"page": page, "limit": page_size}),
+                headers=self.auth_headers,
+            )
+            if not isinstance(payload, list):
+                raise MirrorError("Gitea release assets response is not an array")
+            records.extend(payload)
+            if len(payload) < page_size:
+                break
+        else:
+            raise MirrorError("Gitea release asset pagination exceeded 5000 entries")
+        return self._group_asset_records(records)
 
     def refresh_assets(self, tag: str) -> tuple[Mapping[str, Any], TargetAssets]:
         release = self.get_release(tag)
@@ -1082,6 +1387,7 @@ def load_published_state(
     require_unique_target_identities(candidates)
     manifests: list[PublishedManifest] = []
     trusted_by_name: dict[str, tuple[int, str]] = {}
+    segmented_by_logical: dict[tuple[str, int, str], SegmentedAsset] = {}
     for asset in candidates:
         if asset.size <= 0 or asset.size > MAX_PUBLISHED_MANIFEST_BYTES:
             raise MirrorError(
@@ -1105,11 +1411,19 @@ def load_published_state(
                 raise MirrorError(
                     f"published manifest attachment {asset.id} root is not an object"
                 )
-            packages = tuple(
-                collect_manifest_assets(
-                    raw, mutable_names=(manifest_name, launcher_name)
-                ).values()
+            logical_packages = collect_manifest_assets(
+                raw, mutable_names=(manifest_name, launcher_name)
             )
+            segmented = parse_mirror_transport(
+                raw,
+                logical_packages,
+                mutable_names=(manifest_name, launcher_name),
+            )
+            physical_packages = physical_package_specs(
+                logical_packages,
+                segmented,
+            )
+            packages = tuple(physical_packages.values())
             for package in packages:
                 value = (package.size, package.sha256)
                 previous = trusted_by_name.get(package.name)
@@ -1119,6 +1433,19 @@ def load_published_state(
                         f"asset {package.name!r}"
                     )
                 trusted_by_name[package.name] = value
+            for item in segmented:
+                key = (
+                    item.logical.name,
+                    item.logical.size,
+                    item.logical.sha256,
+                )
+                previous_segmented = segmented_by_logical.get(key)
+                if previous_segmented is not None and previous_segmented != item:
+                    raise MirrorError(
+                        "published manifest checkpoints conflict for segmented "
+                        f"logical asset {item.logical.name!r}"
+                    )
+                segmented_by_logical[key] = item
             manifests.append(
                 PublishedManifest(
                     asset=asset,
@@ -1136,6 +1463,7 @@ def load_published_state(
             (name, size, digest)
             for name, (size, digest) in trusted_by_name.items()
         ),
+        segmented_assets=tuple(segmented_by_logical.values()),
     )
 
 
@@ -1150,6 +1478,56 @@ def download_source(
         expected_sha256=spec.sha256,
     )
     return destination
+
+
+def iter_segment_files(
+    source_path: Path,
+    logical: AssetSpec,
+    temp_root: Path,
+) -> Iterable[tuple[SegmentPart, Path]]:
+    """Materialize and hash one deterministic part at a time.
+
+    ``download_source`` has already verified the complete logical SHA-256.  A
+    yielded part is deleted automatically when iteration resumes or closes, so
+    CI disk use is the verified source ZIP plus at most one 256 MiB part.
+    """
+
+    actual_size = source_path.stat().st_size
+    if actual_size != logical.size:
+        raise MirrorError(
+            f"cannot segment {logical.name}: source size is {actual_size}, "
+            f"expected {logical.size}"
+        )
+    layouts = segment_layout(logical)
+    with source_path.open("rb") as source_stream:
+        for zero_index, layout in enumerate(layouts):
+            destination = temp_root / f"segment-{zero_index:04d}-{layout.spec.name}"
+            digest = hashlib.sha256()
+            remaining = layout.spec.size
+            try:
+                with destination.open("wb") as part_stream:
+                    while remaining:
+                        chunk = source_stream.read(min(8 * 1024 * 1024, remaining))
+                        if not chunk:
+                            raise MirrorError(
+                                f"source {logical.name} ended while writing segment "
+                                f"{zero_index + 1}"
+                            )
+                        part_stream.write(chunk)
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                part = SegmentPart(
+                    spec=dataclasses.replace(
+                        layout.spec,
+                        sha256=digest.hexdigest(),
+                    ),
+                    offset=layout.offset,
+                )
+                yield part, destination
+            finally:
+                destination.unlink(missing_ok=True)
+        if source_stream.read(1):
+            raise MirrorError(f"source {logical.name} contains bytes beyond its size")
 
 
 def asset_trust_key(spec: AssetSpec) -> tuple[str, int, str]:
@@ -1320,6 +1698,62 @@ def delete_with_reconciliation(
         raise MirrorError(
             f"Gitea deletion of attachment {asset.id} did not complete: {delete_error}"
         ) from delete_error
+
+
+def remediate_incomplete_bootstrap_logical(
+    *,
+    client: GiteaReleaseClient,
+    release_id: int,
+    tag: str,
+    logical: AssetSpec,
+    assets: TargetAssets,
+    published_manifest_count: int,
+    cleanup_authorized: bool,
+) -> TargetAssets:
+    """Remove only an interrupted pre-segmentation bootstrap attachment.
+
+    The failed first probe may have left a short attachment under the original
+    logical ZIP name.  It is safe to retire only before any manifest has ever
+    published that name and only when exactly one attachment is provably
+    shorter than the canonical GitHub object.  Immutable orphan parts and all
+    post-publication attachments are deliberately left alone.
+    """
+
+    candidates = target_candidates(assets, logical.name)
+    if not candidates or published_manifest_count:
+        return assets
+    if len(candidates) != 1:
+        raise MirrorError(
+            f"cannot remediate bootstrap logical asset {logical.name}: "
+            f"found {len(candidates)} attachments"
+        )
+    candidate = candidates[0]
+    if candidate.size >= logical.size:
+        raise MirrorError(
+            f"unreferenced bootstrap logical asset {logical.name} has size "
+            f"{candidate.size}; only a strictly smaller interrupted upload may "
+            "be removed automatically"
+        )
+    if not cleanup_authorized:
+        raise MirrorError(
+            f"refusing bootstrap cleanup for {logical.name} without progression guard"
+        )
+    print(
+        f"deleting incomplete pre-segmentation bootstrap asset: {logical.name} "
+        f"({candidate.size}/{logical.size} bytes)"
+    )
+    delete_with_reconciliation(
+        client=client,
+        release_id=release_id,
+        tag=tag,
+        asset=candidate,
+    )
+    _, refreshed = client.refresh_assets(tag)
+    if target_candidates(refreshed, logical.name):
+        raise MirrorError(
+            f"incomplete bootstrap logical asset {logical.name} remained after deletion"
+        )
+    return refreshed
 
 
 def reconcile_legacy_previous(
@@ -1502,7 +1936,7 @@ def replace_mutable_attachment(
 def sync_asset(
     *,
     spec: AssetSpec,
-    source: SourceAsset,
+    source: SourceAsset | None,
     mutable: bool,
     verify_existing_sha: bool,
     client: GiteaReleaseClient,
@@ -1514,6 +1948,8 @@ def sync_asset(
     certifications: MutableMapping[str, TargetCertification],
     cleanup_authorized: bool,
     recover_incomplete_immutable: bool = False,
+    local_source_path: Path | None = None,
+    stage_new_immutable: bool = False,
 ) -> str:
     require_unique_target_identities(all_target_assets(existing_assets))
     if mutable:
@@ -1614,12 +2050,28 @@ def sync_asset(
             return "certified-existing"
     staged = (
         verified_pending_asset(existing_assets, spec, temp_root)
-        if mutable
+        if mutable or stage_new_immutable
         else None
     )
-    source_path = None if staged is not None else download_source(source, spec, temp_root)
+    owns_source_path = False
+    if staged is not None:
+        source_path = None
+    elif local_source_path is not None:
+        source_path = local_source_path
+        if source_path.stat().st_size != spec.size:
+            raise MirrorError(
+                f"local source for {spec.name} has size "
+                f"{source_path.stat().st_size}; expected {spec.size}"
+            )
+        if sha256_file(source_path) != spec.sha256:
+            raise MirrorError(f"local source for {spec.name} failed SHA-256 check")
+    else:
+        if source is None:
+            raise MirrorError(f"no source is available to upload {spec.name}")
+        source_path = download_source(source, spec, temp_root)
+        owns_source_path = True
     try:
-        if mutable:
+        if mutable or stage_new_immutable:
             final = replace_mutable_attachment(
                 client=client,
                 release_id=release_id,
@@ -1632,7 +2084,7 @@ def sync_asset(
                 cleanup_authorized=cleanup_authorized,
             )
             certify_target(certifications, final, spec)
-            outcome = "replaced" if candidates else "uploaded"
+            outcome = "replaced" if mutable and candidates else "uploaded"
             print(f"{outcome} and verified: {spec.name}")
             return outcome
 
@@ -1665,8 +2117,280 @@ def sync_asset(
         print(f"uploaded and verified: {spec.name}")
         return "uploaded"
     finally:
-        if source_path is not None:
+        if owns_source_path and source_path is not None:
             source_path.unlink(missing_ok=True)
+
+
+def target_has_complete_segment_map(
+    assets: TargetAssets,
+    segmented: SegmentedAsset,
+) -> bool:
+    for part in segmented.parts:
+        candidates = target_candidates(assets, part.spec.name)
+        if len(candidates) != 1 or candidates[0].size != part.spec.size:
+            return False
+    return True
+
+
+def sync_segmented_logical(
+    *,
+    logical: AssetSpec,
+    source: SourceAsset,
+    published: SegmentedAsset | None,
+    verify_existing_sha: bool,
+    client: GiteaReleaseClient,
+    release_id: int,
+    tag: str,
+    existing_assets: TargetAssets,
+    temp_root: Path,
+    trusted_assets: frozenset[tuple[str, int, str]],
+    certifications: MutableMapping[str, TargetCertification],
+    cleanup_authorized: bool,
+    published_manifest_count: int,
+) -> tuple[SegmentedAsset, list[dict[str, Any]]]:
+    existing_assets = remediate_incomplete_bootstrap_logical(
+        client=client,
+        release_id=release_id,
+        tag=tag,
+        logical=logical,
+        assets=existing_assets,
+        published_manifest_count=published_manifest_count,
+        cleanup_authorized=cleanup_authorized,
+    )
+    results: list[dict[str, Any]] = []
+    if published is not None and target_has_complete_segment_map(
+        existing_assets, published
+    ):
+        for part in published.parts:
+            _, current_assets = client.refresh_assets(tag)
+            result = sync_asset(
+                spec=part.spec,
+                source=None,
+                mutable=False,
+                verify_existing_sha=verify_existing_sha,
+                client=client,
+                release_id=release_id,
+                tag=tag,
+                existing_assets=current_assets,
+                temp_root=temp_root,
+                trusted_assets=trusted_assets,
+                certifications=certifications,
+                cleanup_authorized=cleanup_authorized,
+            )
+            results.append(
+                {
+                    "name": part.spec.name,
+                    "logicalName": logical.name,
+                    "offset": part.offset,
+                    "result": result,
+                }
+            )
+        return published, results
+
+    source_path = download_source(source, logical, temp_root)
+    generated: list[SegmentPart] = []
+    try:
+        expected_parts = published.parts if published is not None else None
+        iterator = iter_segment_files(source_path, logical, temp_root)
+        for zero_index, (part, part_path) in enumerate(iterator):
+            if expected_parts is not None and part != expected_parts[zero_index]:
+                raise MirrorError(
+                    f"recreated segment {zero_index + 1} for {logical.name} "
+                    "does not match the published transport map"
+                )
+            _, current_assets = client.refresh_assets(tag)
+            result = sync_asset(
+                spec=part.spec,
+                source=None,
+                mutable=False,
+                verify_existing_sha=verify_existing_sha,
+                client=client,
+                release_id=release_id,
+                tag=tag,
+                existing_assets=current_assets,
+                temp_root=temp_root,
+                trusted_assets=trusted_assets,
+                certifications=certifications,
+                cleanup_authorized=cleanup_authorized,
+                local_source_path=part_path,
+                stage_new_immutable=True,
+            )
+            generated.append(part)
+            results.append(
+                {
+                    "name": part.spec.name,
+                    "logicalName": logical.name,
+                    "offset": part.offset,
+                    "result": result,
+                }
+            )
+    finally:
+        source_path.unlink(missing_ok=True)
+    segmented = SegmentedAsset(logical=logical, parts=tuple(generated))
+    # Validate contiguity, names, sizes and the newly calculated part digests.
+    probe_manifest = {
+        "fullPackages": [
+            {
+                "assetName": logical.name,
+                "size": logical.size,
+                "sha256": logical.sha256,
+            }
+        ],
+        MIRROR_TRANSPORT_FIELD: {
+            "schemaVersion": MIRROR_TRANSPORT_SCHEMA_VERSION,
+            "segmentSize": SEGMENT_SIZE_BYTES,
+            "segmentedAssets": [segmented_asset_json(segmented)],
+        },
+    }
+    parse_mirror_transport(probe_manifest, {logical.name: logical})
+    return segmented, results
+
+
+def sync_probe_segment(
+    *,
+    logical: AssetSpec,
+    source: SourceAsset,
+    published: SegmentedAsset | None,
+    client: GiteaReleaseClient,
+    release_id: int,
+    tag: str,
+    existing_assets: TargetAssets,
+    temp_root: Path,
+    trusted_assets: frozenset[tuple[str, int, str]],
+    certifications: MutableMapping[str, TargetCertification],
+    cleanup_authorized: bool,
+    published_manifest_count: int,
+) -> tuple[SegmentPart, str]:
+    existing_assets = remediate_incomplete_bootstrap_logical(
+        client=client,
+        release_id=release_id,
+        tag=tag,
+        logical=logical,
+        assets=existing_assets,
+        published_manifest_count=published_manifest_count,
+        cleanup_authorized=cleanup_authorized,
+    )
+    if published is not None:
+        first = published.parts[0]
+        candidates = target_candidates(existing_assets, first.spec.name)
+        if len(candidates) == 1 and candidates[0].size == first.spec.size:
+            result = sync_asset(
+                spec=first.spec,
+                source=None,
+                mutable=False,
+                verify_existing_sha=True,
+                client=client,
+                release_id=release_id,
+                tag=tag,
+                existing_assets=existing_assets,
+                temp_root=temp_root,
+                trusted_assets=trusted_assets,
+                certifications=certifications,
+                cleanup_authorized=cleanup_authorized,
+            )
+            return first, result
+
+    source_path = download_source(source, logical, temp_root)
+    iterator = iter(iter_segment_files(source_path, logical, temp_root))
+    try:
+        first, first_path = next(iterator)
+        if published is not None and first != published.parts[0]:
+            raise MirrorError(
+                f"recreated probe segment for {logical.name} does not match "
+                "the published transport map"
+            )
+        result = sync_asset(
+            spec=first.spec,
+            source=None,
+            mutable=False,
+            verify_existing_sha=True,
+            client=client,
+            release_id=release_id,
+            tag=tag,
+            existing_assets=existing_assets,
+            temp_root=temp_root,
+            trusted_assets=trusted_assets,
+            certifications=certifications,
+            cleanup_authorized=cleanup_authorized,
+            local_source_path=first_path,
+            stage_new_immutable=True,
+        )
+        return first, result
+    finally:
+        iterator.close()
+        source_path.unlink(missing_ok=True)
+
+
+def stale_published_candidates(
+    published_state: PublishedState,
+    assets: TargetAssets,
+    desired_specs: Sequence[AssetSpec],
+) -> list[tuple[TargetAsset, AssetSpec]]:
+    """Select only exact prior-manifest references no longer desired."""
+
+    desired_names = {spec.name for spec in desired_specs}
+    prior_by_name: dict[str, AssetSpec] = {}
+    for manifest in published_state.manifests:
+        for spec in manifest.packages:
+            add_spec(prior_by_name, spec)
+    result: list[tuple[TargetAsset, AssetSpec]] = []
+    for name in sorted(prior_by_name, key=str.casefold):
+        if name in desired_names:
+            continue
+        spec = prior_by_name[name]
+        candidates = target_candidates(assets, name)
+        if len(candidates) != 1 or candidates[0].size != spec.size:
+            # Ambiguous/missing/mismatched records are not exact enough for an
+            # automated immutable deletion.  They remain for manual audit.
+            continue
+        result.append((candidates[0], spec))
+    return result
+
+
+def prune_stale_published_assets(
+    *,
+    client: GiteaReleaseClient,
+    release_id: int,
+    tag: str,
+    candidates: Sequence[tuple[TargetAsset, AssetSpec]],
+    temp_root: Path,
+) -> list[dict[str, Any]]:
+    """Prune prior references only after the new manifest is fully active."""
+
+    results: list[dict[str, Any]] = []
+    for captured, spec in candidates:
+        _, assets = client.refresh_assets(tag)
+        current = target_by_id(assets, captured.id)
+        if current != captured:
+            results.append(
+                {"name": spec.name, "id": captured.id, "result": "skipped-changed"}
+            )
+            continue
+        try:
+            verify_public_target(current, spec, temp_root)
+        except MirrorError as exc:
+            print(
+                f"WARNING: stale published asset {captured.id} was not pruned: {exc}",
+                file=sys.stderr,
+            )
+            results.append(
+                {
+                    "name": spec.name,
+                    "id": captured.id,
+                    "result": "skipped-unverified",
+                }
+            )
+            continue
+        delete_with_reconciliation(
+            client=client,
+            release_id=release_id,
+            tag=tag,
+            asset=current,
+        )
+        results.append(
+            {"name": spec.name, "id": captured.id, "result": "pruned"}
+        )
+    return results
 
 
 def write_json(path: Path | None, value: Mapping[str, Any]) -> None:
@@ -1702,10 +2426,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--probe-largest-full",
         action="store_true",
         help=(
-            "Upload and anonymously verify only the largest current full package. "
-            "The asset keeps its canonical name in the permanent target release, "
-            "so a successful probe is reused by the later bootstrap. Does not "
-            "publish the launcher or manifest. Combine with --dry-run to plan only."
+            "Download/verify the largest current full package, then upload and "
+            "anonymously verify only its first <=256 MiB transport part. The part "
+            "is reused by the later bootstrap. Does not publish the launcher or "
+            "manifest. Combine with --dry-run to plan only."
         ),
     )
     parser.add_argument(
@@ -1725,7 +2449,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
+    args = parse_args(sys.argv[1:] if argv is None else argv)
     manifest_name = validate_asset_name(args.manifest_name, "--manifest-name")
     launcher_name = validate_asset_name(args.launcher_name, "--launcher-name")
     allow_rollback = rollback_override_enabled(args.allow_rollback, os.environ)
@@ -1777,14 +2501,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         for spec in package_specs.values():
             source_client.require(spec)
-        manifest_spec = AssetSpec(
-            manifest_name, manifest_source.size, manifest_digest, "manifest-last"
-        )
+        if MIRROR_TRANSPORT_FIELD in manifest:
+            raise MirrorError(
+                "canonical GitHub manifest must not contain mirrorTransport"
+            )
+        for spec in package_specs.values():
+            if spec.size > args.max_asset_bytes:
+                raise MirrorError(
+                    f"{spec.name} is {spec.size} bytes; source-object safety limit is "
+                    f"{args.max_asset_bytes}"
+                )
+
+        launcher_spec: AssetSpec | None = None
+        probe_logical: AssetSpec | None = None
         if args.probe_largest_full:
-            probe_spec = largest_full_package(manifest)
-            source_client.require(probe_spec)
-            specs = [probe_spec]
-            operation = "largest-full-probe"
+            probe_logical = largest_full_package(manifest)
+            source_client.require(probe_logical)
+            operation = "first-segment-probe"
         else:
             assert launcher_source is not None
             if launcher_source.sha256 is None:
@@ -1800,28 +2533,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     launcher_path.unlink(missing_ok=True)
             else:
                 launcher_digest = launcher_source.sha256
-
             launcher_spec = AssetSpec(
                 launcher_name, launcher_source.size, launcher_digest, "launcher"
             )
-            specs = ordered_specs(package_specs, launcher_spec, manifest_spec)
-            operation = "mirror"
-        if len(specs) > args.max_assets:
-            raise MirrorError(
-                f"desired mirror has {len(specs)} assets; limit is {args.max_assets}"
-            )
-        for spec in specs:
-            if spec.size > args.max_asset_bytes:
-                raise MirrorError(
-                    f"{spec.name} is {spec.size} bytes; per-asset safety limit is "
-                    f"{args.max_asset_bytes}"
-                )
-        total_size = sum(spec.size for spec in specs)
-        if total_size > args.max_total_bytes:
-            raise MirrorError(
-                f"desired mirror is {total_size} bytes; total safety limit is "
-                f"{args.max_total_bytes}"
-            )
+            operation = "segmented-mirror"
 
         target_client = GiteaReleaseClient(args.gitea_url, args.gitea_repo, gitea_token)
         target_client.require_public_repo()
@@ -1848,38 +2563,170 @@ def main(argv: Sequence[str] | None = None) -> int:
             published_manifest_count=len(published_state.manifests),
         )
 
-        actions: list[dict[str, Any]] = []
-        recover_incomplete_probe = (
-            args.probe_largest_full and not published_state.manifests
-        )
-        for spec in specs:
-            current = target_candidates(target_assets, spec.name)
-            mutable = spec.kind in {"launcher", "manifest-last"}
-            action = planned_action(
-                spec,
-                current,
-                mutable=mutable,
-                verify_existing_sha=verify_existing_sha,
-                trusted_assets=published_state.trusted_assets,
-                recover_incomplete_immutable=recover_incomplete_probe,
+        provisional_segmented: list[SegmentedAsset] = []
+        for logical in sorted(package_specs.values(), key=lambda item: item.name.casefold()):
+            if logical.size <= SEGMENT_SIZE_BYTES:
+                continue
+            published = published_segment_for(published_state, logical)
+            provisional_segmented.append(
+                published
+                if published is not None
+                else SegmentedAsset(logical=logical, parts=segment_layout(logical))
             )
+        provisional_physical = physical_package_specs(
+            package_specs,
+            provisional_segmented,
+        )
+
+        if args.probe_largest_full:
+            assert probe_logical is not None
+            if probe_logical.size > SEGMENT_SIZE_BYTES:
+                probe_segmented = next(
+                    item
+                    for item in provisional_segmented
+                    if item.logical.name == probe_logical.name
+                )
+                plan_package_specs = [probe_segmented.parts[0].spec]
+            else:
+                plan_package_specs = [probe_logical]
+            provisional_manifest_bytes = b""
+            plan_specs = list(plan_package_specs)
+        else:
+            assert launcher_spec is not None
+            provisional_manifest = build_derived_manifest(
+                manifest,
+                package_specs,
+                provisional_segmented,
+            )
+            provisional_manifest_bytes = serialize_manifest(provisional_manifest)
+            provisional_manifest_spec = AssetSpec(
+                manifest_name,
+                len(provisional_manifest_bytes),
+                hashlib.sha256(provisional_manifest_bytes).hexdigest(),
+                "derived-manifest-last",
+            )
+            plan_package_specs = sorted(
+                provisional_physical.values(), key=lambda item: item.name.casefold()
+            )
+            plan_specs = [
+                *plan_package_specs,
+                launcher_spec,
+                provisional_manifest_spec,
+            ]
+
+        if len(plan_specs) > args.max_assets:
+            raise MirrorError(
+                f"desired mirror has {len(plan_specs)} physical assets; "
+                f"limit is {args.max_assets}"
+            )
+        for spec in plan_specs:
+            if spec.size > SEGMENT_SIZE_BYTES and spec.kind.startswith("segment:"):
+                raise MirrorError(
+                    f"transport part {spec.name} exceeds {SEGMENT_SIZE_BYTES} bytes"
+                )
+        total_size = sum(spec.size for spec in plan_specs)
+        if total_size > args.max_total_bytes:
+            raise MirrorError(
+                f"desired mirror is {total_size} bytes; total safety limit is "
+                f"{args.max_total_bytes}"
+            )
+
+        actions: list[dict[str, Any]] = []
+        segmented_part_names = {
+            part.spec.name
+            for item in provisional_segmented
+            for part in item.parts
+        }
+        known_part_digests = {
+            part.spec.name: part.spec.sha256
+            for item in published_state.segmented_assets
+            for part in item.parts
+        }
+        for spec in plan_specs:
+            current = target_candidates(target_assets, spec.name)
+            mutable = spec.kind in {"launcher", "derived-manifest-last"}
+            digest_known = (
+                spec.name not in segmented_part_names
+                or spec.name in known_part_digests
+            )
+            if spec.kind == "derived-manifest-last":
+                action = "stage-derived-manifest-last"
+            elif not digest_known:
+                if len(current) > 1 or (
+                    current and current[0].size != spec.size
+                ):
+                    action = "conflict"
+                elif current:
+                    action = "hash-source-part-and-verify"
+                else:
+                    action = "hash-source-part-and-upload"
+            else:
+                action = planned_action(
+                    spec,
+                    current,
+                    mutable=mutable,
+                    verify_existing_sha=verify_existing_sha,
+                    trusted_assets=published_state.trusted_assets,
+                )
             actions.append(
                 {
                     "name": spec.name,
                     "kind": spec.kind,
                     "size": spec.size,
-                    "sha256": spec.sha256,
+                    "sha256": spec.sha256 if digest_known else None,
                     "action": action,
                     "targetCanonicalCount": len(current),
                 }
             )
+
+        bootstrap_cleanup: list[dict[str, Any]] = []
+        if not published_state.manifests:
+            logical_scope = (
+                [probe_logical]
+                if args.probe_largest_full
+                else [
+                    spec
+                    for spec in package_specs.values()
+                    if spec.size > SEGMENT_SIZE_BYTES
+                ]
+            )
+            for logical in logical_scope:
+                assert logical is not None
+                candidates = target_candidates(target_assets, logical.name)
+                if not candidates:
+                    continue
+                safe = len(candidates) == 1 and 0 < candidates[0].size < logical.size
+                bootstrap_cleanup.append(
+                    {
+                        "name": logical.name,
+                        "expectedSize": logical.size,
+                        "targetSizes": [item.size for item in candidates],
+                        "action": (
+                            "delete-incomplete-bootstrap-logical"
+                            if safe
+                            else "conflict"
+                        ),
+                    }
+                )
+        planned_prune = (
+            []
+            if args.probe_largest_full
+            else [
+                {"name": spec.name, "id": asset.id, "size": spec.size}
+                for asset, spec in stale_published_candidates(
+                    published_state,
+                    target_assets,
+                    [*plan_package_specs, launcher_spec],
+                )
+            ]
+        )
 
         plan = {
             "operation": operation,
             "source": {
                 "repository": args.github_repo,
                 "tag": args.github_tag,
-                "manifestSha256": manifest_digest,
+                "canonicalManifestSha256": manifest_digest,
             },
             "target": {
                 "baseUrl": args.gitea_url,
@@ -1896,25 +2743,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             "rollbackOverride": allow_rollback,
             "bootstrapRequiresExistingSha": bootstrap_sha_verification,
             "effectiveVerifyExistingSha": verify_existing_sha,
-            "assetCount": len(specs),
-            "packageAssetCount": len(specs) if args.probe_largest_full else len(package_specs),
+            "transportSchemaVersion": MIRROR_TRANSPORT_SCHEMA_VERSION,
+            "segmentSize": SEGMENT_SIZE_BYTES,
+            "logicalPackageCount": (
+                1 if args.probe_largest_full else len(package_specs)
+            ),
+            "segmentedLogicalPackageCount": (
+                int(bool(probe_logical and probe_logical.size > SEGMENT_SIZE_BYTES))
+                if args.probe_largest_full
+                else len(provisional_segmented)
+            ),
+            "assetCount": len(plan_specs),
+            "packageAssetCount": len(plan_package_specs),
             "totalBytes": total_size,
             "manifestWillChange": not args.probe_largest_full,
-            "manifestIsLast": (
-                specs[-1].name == manifest_name if not args.probe_largest_full else False
-            ),
+            "manifestIsLast": not args.probe_largest_full,
+            "bootstrapCleanup": bootstrap_cleanup,
+            "postManifestPrune": planned_prune,
             "actions": actions,
         }
         write_json(args.plan_out, plan)
         print(
             f"plan: operation={operation}, version={version}, "
             f"packages={plan['packageAssetCount']}, "
-            f"assets={len(specs)}, totalBytes={total_size}, "
+            f"assets={len(plan_specs)}, totalBytes={total_size}, "
             f"manifestWillChange={plan['manifestWillChange']}"
         )
         for action in actions:
             print(f"  {action['action']:22} {action['size']:12} {action['name']}")
-        if any(action["action"] == "conflict" for action in actions):
+        if any(action["action"] == "conflict" for action in [*actions, *bootstrap_cleanup]):
             raise MirrorError("immutable target asset conflict found during planning")
         if args.dry_run:
             print("dry-run: no Gitea release or attachment was changed")
@@ -1928,24 +2785,47 @@ def main(argv: Sequence[str] | None = None) -> int:
         certifications: dict[str, TargetCertification] = {}
 
         if args.probe_largest_full:
-            probe_spec = specs[0]
+            assert probe_logical is not None
             _, target_assets = target_client.refresh_assets(args.gitea_tag)
-            probe_result = sync_asset(
-                spec=probe_spec,
-                source=source_client.require(probe_spec),
-                mutable=False,
-                verify_existing_sha=True,
-                client=target_client,
-                release_id=release_id,
-                tag=args.gitea_tag,
-                existing_assets=target_assets,
-                temp_root=temp_root,
-                trusted_assets=published_state.trusted_assets,
-                certifications=certifications,
-                cleanup_authorized=cleanup_authorized_for_progression(progression),
-                recover_incomplete_immutable=recover_incomplete_probe,
+            if probe_logical.size > SEGMENT_SIZE_BYTES:
+                probe_part, probe_result = sync_probe_segment(
+                    logical=probe_logical,
+                    source=source_client.require(probe_logical),
+                    published=published_segment_for(published_state, probe_logical),
+                    client=target_client,
+                    release_id=release_id,
+                    tag=args.gitea_tag,
+                    existing_assets=target_assets,
+                    temp_root=temp_root,
+                    trusted_assets=published_state.trusted_assets,
+                    certifications=certifications,
+                    cleanup_authorized=cleanup_authorized_for_progression(progression),
+                    published_manifest_count=len(published_state.manifests),
+                )
+                probe_spec = probe_part.spec
+            else:
+                probe_spec = probe_logical
+                probe_result = sync_asset(
+                    spec=probe_spec,
+                    source=source_client.require(probe_spec),
+                    mutable=False,
+                    verify_existing_sha=True,
+                    client=target_client,
+                    release_id=release_id,
+                    tag=args.gitea_tag,
+                    existing_assets=target_assets,
+                    temp_root=temp_root,
+                    trusted_assets=published_state.trusted_assets,
+                    certifications=certifications,
+                    cleanup_authorized=cleanup_authorized_for_progression(progression),
+                )
+            results.append(
+                {
+                    "name": probe_spec.name,
+                    "logicalName": probe_logical.name,
+                    "result": probe_result,
+                }
             )
-            results.append({"name": probe_spec.name, "result": probe_result})
             _, final_assets = target_client.refresh_assets(args.gitea_tag)
             final_probe_candidates = target_candidates(final_assets, probe_spec.name)
             require_certified_targets(
@@ -1966,56 +2846,117 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 "assetCount": 1,
                 "totalBytes": probe_spec.size,
+                "sourceVerifiedBytes": probe_logical.size,
                 "manifestChanged": False,
                 "results": results,
             }
             write_json(args.receipt_out, receipt)
             print(
-                f"large-upload probe complete: {probe_spec.name}, "
+                f"first-segment probe complete: {probe_spec.name}, "
                 f"size={probe_spec.size}, sha256={probe_spec.sha256}; "
                 "manifest-dev.json unchanged"
             )
             return 0
 
-        # Manifest is excluded from this loop by construction and synchronized
-        # only after every package and the launcher succeeds.
-        for spec in specs[:-1]:
+        actual_segmented: list[SegmentedAsset] = []
+        physical_specs: list[AssetSpec] = []
+        for logical in sorted(package_specs.values(), key=lambda item: item.name.casefold()):
             _, target_assets = target_client.refresh_assets(args.gitea_tag)
-            if spec.kind == "launcher":
-                latest_state = load_published_state(
-                    target_client,
-                    target_assets,
-                    manifest_name,
-                    launcher_name,
-                    temp_root,
+            if logical.size > SEGMENT_SIZE_BYTES:
+                segmented, segment_results = sync_segmented_logical(
+                    logical=logical,
+                    source=source_client.require(logical),
+                    published=published_segment_for(published_state, logical),
+                    verify_existing_sha=verify_existing_sha,
+                    client=target_client,
+                    release_id=release_id,
+                    tag=args.gitea_tag,
+                    existing_assets=target_assets,
+                    temp_root=temp_root,
+                    trusted_assets=published_state.trusted_assets,
+                    certifications=certifications,
+                    cleanup_authorized=cleanup_authorized_for_progression(progression),
+                    published_manifest_count=len(published_state.manifests),
                 )
-                progression = validate_manifest_progression(
-                    source_identity,
-                    latest_state.identities,
-                    allow_rollback=allow_rollback,
-                )
-            else:
-                latest_state = published_state
-            source = source_client.require(spec)
+                actual_segmented.append(segmented)
+                physical_specs.extend(part.spec for part in segmented.parts)
+                results.extend(segment_results)
+                continue
             result = sync_asset(
-                spec=spec,
-                source=source,
-                mutable=spec.kind == "launcher",
+                spec=logical,
+                source=source_client.require(logical),
+                mutable=False,
                 verify_existing_sha=verify_existing_sha,
                 client=target_client,
                 release_id=release_id,
                 tag=args.gitea_tag,
                 existing_assets=target_assets,
                 temp_root=temp_root,
-                trusted_assets=latest_state.trusted_assets,
+                trusted_assets=published_state.trusted_assets,
                 certifications=certifications,
                 cleanup_authorized=cleanup_authorized_for_progression(progression),
             )
-            results.append({"name": spec.name, "result": result})
+            physical_specs.append(logical)
+            results.append({"name": logical.name, "result": result})
+
+        assert launcher_spec is not None and launcher_source is not None
+        _, target_assets = target_client.refresh_assets(args.gitea_tag)
+        latest_state = load_published_state(
+            target_client,
+            target_assets,
+            manifest_name,
+            launcher_name,
+            temp_root,
+        )
+        progression = validate_manifest_progression(
+            source_identity,
+            latest_state.identities,
+            allow_rollback=allow_rollback,
+        )
+        launcher_result = sync_asset(
+            spec=launcher_spec,
+            source=launcher_source,
+            mutable=True,
+            verify_existing_sha=True,
+            client=target_client,
+            release_id=release_id,
+            tag=args.gitea_tag,
+            existing_assets=target_assets,
+            temp_root=temp_root,
+            trusted_assets=latest_state.trusted_assets,
+            certifications=certifications,
+            cleanup_authorized=cleanup_authorized_for_progression(progression),
+        )
+        physical_specs.append(launcher_spec)
+        results.append({"name": launcher_spec.name, "result": launcher_result})
+
+        unique_physical_specs: dict[str, AssetSpec] = {}
+        for spec in physical_specs:
+            add_spec(unique_physical_specs, spec)
+        physical_specs = list(unique_physical_specs.values())
 
         _, target_assets = target_client.refresh_assets(args.gitea_tag)
-        require_certified_targets(
-            target_assets, specs[:-1], certifications
+        require_certified_targets(target_assets, physical_specs, certifications)
+        stale_candidates = stale_published_candidates(
+            published_state,
+            target_assets,
+            physical_specs,
+        )
+
+        derived_manifest = build_derived_manifest(
+            manifest,
+            package_specs,
+            actual_segmented,
+        )
+        derived_manifest_bytes = serialize_manifest(derived_manifest)
+        derived_manifest_path = temp_root / f"derived-{manifest_name}"
+        derived_manifest_path.write_bytes(derived_manifest_bytes)
+        derived_manifest_digest = hashlib.sha256(derived_manifest_bytes).hexdigest()
+        manifest_spec = AssetSpec(
+            manifest_name,
+            len(derived_manifest_bytes),
+            derived_manifest_digest,
+            "derived-manifest-last",
         )
 
         _, target_assets = target_client.refresh_assets(args.gitea_tag)
@@ -2033,7 +2974,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         manifest_result = sync_asset(
             spec=manifest_spec,
-            source=manifest_source,
+            source=None,
             mutable=True,
             verify_existing_sha=True,
             client=target_client,
@@ -2044,6 +2985,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             trusted_assets=latest_state.trusted_assets,
             certifications=certifications,
             cleanup_authorized=cleanup_authorized_for_progression(progression),
+            local_source_path=derived_manifest_path,
         )
         results.append({"name": manifest_spec.name, "result": manifest_result})
 
@@ -2058,23 +3000,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         verify_public_canonical(
             target_client, args.gitea_tag, manifest_spec, temp_root
         )
+        prune_results = prune_stale_published_assets(
+            client=target_client,
+            release_id=release_id,
+            tag=args.gitea_tag,
+            candidates=stale_candidates,
+            temp_root=temp_root,
+        )
 
         receipt = {
             "completedAtUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "version": version,
             "contentHash": content_hash,
-            "manifestSha256": manifest_digest,
+            "sourceManifestSha256": manifest_digest,
+            "manifestSha256": derived_manifest_digest,
             "manifestProgression": progression,
             "rollbackOverride": allow_rollback,
             "target": f"{args.gitea_url}/{args.gitea_repo}/releases/tag/{args.gitea_tag}",
-            "assetCount": len(specs),
-            "totalBytes": total_size,
+            "assetCount": len(physical_specs) + 1,
+            "logicalPackageCount": len(package_specs),
+            "segmentedLogicalPackageCount": len(actual_segmented),
+            "totalBytes": sum(item.size for item in physical_specs)
+            + manifest_spec.size,
             "results": results,
+            "postManifestPrune": prune_results,
         }
         write_json(args.receipt_out, receipt)
         print(
             f"mirror complete: {version}, contentHash={content_hash}, "
-            f"manifestSha256={manifest_digest}"
+            f"sourceManifestSha256={manifest_digest}, "
+            f"giteaManifestSha256={derived_manifest_digest}"
         )
         return 0
 

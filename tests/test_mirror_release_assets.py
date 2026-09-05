@@ -6,7 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import mirror_release_assets as mirror
 from mirror_release_assets import (
@@ -14,22 +14,35 @@ from mirror_release_assets import (
     GiteaReleaseClient,
     ManifestIdentity,
     MirrorError,
+    PublishedManifest,
+    PublishedState,
     SourceAsset,
+    SegmentedAsset,
+    SegmentPart,
     TargetAsset,
+    build_derived_manifest,
     collect_manifest_assets,
     download_file,
     effective_existing_sha_verification,
     largest_full_package,
     load_published_state,
     manifest_identity,
+    iter_segment_files,
     ordered_specs,
+    parse_mirror_transport,
     parse_args,
     planned_action,
     published_manifest_candidates,
+    remediate_incomplete_bootstrap_logical,
     require_certified_targets,
     replace_mutable_attachment,
     rollback_override_enabled,
+    segment_layout,
+    serialize_manifest,
+    stale_published_candidates,
+    prune_stale_published_assets,
     sync_asset,
+    sync_segmented_logical,
     validate_asset_name,
     validate_manifest_progression,
     verify_public_target,
@@ -90,6 +103,7 @@ class FakeGiteaClient:
         self.rename_failure = rename_failure
         self.delete_failure = delete_failure
         self.rename_uuid_change = rename_uuid_change
+        self.uploaded_payloads = {}
 
     def grouped(self):
         grouped = {}
@@ -109,6 +123,7 @@ class FakeGiteaClient:
             self.upload_failure = None
             raise TimeoutError("upload timed out before commit")
         self.assets[asset.id] = asset
+        self.uploaded_payloads[asset.id] = path.read_bytes()
         if self.upload_failure == "after":
             self.upload_failure = None
             raise TimeoutError("upload timed out after commit")
@@ -347,7 +362,7 @@ class ManifestAssetsTests(unittest.TestCase):
         client = GiteaReleaseClient(
             "https://example.invalid", "owner/repo", token=None
         )
-        assets = client.release_assets(release)
+        assets = client._group_asset_records(release["assets"])
         self.assertEqual([item.id for item in assets["manifest-dev.json"]], [1, 2])
         self.assertNotEqual(
             assets["manifest-dev.json"][0].download_url,
@@ -364,7 +379,7 @@ class ManifestAssetsTests(unittest.TestCase):
             "browser_download_url": "https://example.invalid/releases/download/tag/asset.zip",
         }
         with self.assertRaisesRegex(MirrorError, "attachment UUID"):
-            client.release_assets({"assets": [{"id": 1, **base}]})
+            client._group_asset_records([{"id": 1, **base}])
 
         first = {
             "id": 1,
@@ -373,7 +388,438 @@ class ManifestAssetsTests(unittest.TestCase):
         }
         second = {**first, "id": 2}
         with self.assertRaisesRegex(MirrorError, "duplicate Gitea attachment UUID"):
-            client.release_assets({"assets": [first, second]})
+            client._group_asset_records([first, second])
+
+    def test_gitea_asset_listing_uses_all_paginated_records(self):
+        client = GiteaReleaseClient(
+            "https://example.invalid", "owner/repo", token=None
+        )
+
+        def record(asset_id):
+            return {
+                "id": asset_id,
+                "uuid": f"00000000-0000-0000-0000-{asset_id:012x}",
+                "name": f"part-{asset_id:03d}.bin",
+                "size": 3,
+                "browser_download_url": (
+                    "https://example.invalid/releases/download/dev-channel/"
+                    f"part-{asset_id:03d}.bin"
+                ),
+            }
+
+        pages = [
+            (200, [record(index) for index in range(1, 51)]),
+            (200, [record(index) for index in range(51, 101)]),
+            (200, [record(index) for index in range(101, 104)]),
+        ]
+        with patch.object(mirror, "request_json", side_effect=pages) as request:
+            assets = client.release_assets({"id": 99, "assets": []})
+        self.assertEqual(sum(map(len, assets.values())), 103)
+        self.assertEqual(request.call_count, 3)
+        self.assertIn("page=3&limit=50", request.call_args.args[0])
+
+
+class SegmentedTransportTests(unittest.TestCase):
+    def setUp(self):
+        self.segment_size = patch.object(mirror, "SEGMENT_SIZE_BYTES", 4)
+        self.segment_size.start()
+        self.addCleanup(self.segment_size.stop)
+        self.logical_bytes = b"abcdefghij"
+        self.logical = AssetSpec(
+            "large.zip",
+            len(self.logical_bytes),
+            hashlib.sha256(self.logical_bytes).hexdigest(),
+            "fullPackages[0]",
+        )
+
+    def test_layout_is_deterministic_contiguous_and_bounded(self):
+        first = segment_layout(self.logical)
+        second = segment_layout(self.logical)
+        self.assertEqual(first, second)
+        self.assertEqual([part.offset for part in first], [0, 4, 8])
+        self.assertEqual([part.spec.size for part in first], [4, 4, 2])
+        self.assertEqual(len({part.spec.name for part in first}), 3)
+        self.assertTrue(all(part.spec.size <= 4 for part in first))
+        self.assertTrue(all(self.logical.sha256 in part.spec.name for part in first))
+
+    def test_streaming_split_hashes_exact_raw_byte_ranges(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp_root = Path(temp_name)
+            source = temp_root / "source.zip"
+            source.write_bytes(self.logical_bytes)
+            seen = []
+            for part, path in iter_segment_files(source, self.logical, temp_root):
+                payload = path.read_bytes()
+                seen.append((part, payload))
+                self.assertEqual(part.spec.sha256, hashlib.sha256(payload).hexdigest())
+            self.assertEqual(b"".join(payload for _, payload in seen), self.logical_bytes)
+            self.assertFalse(any(temp_root.glob("segment-*")))
+
+    def test_derived_manifest_retains_source_fields_and_round_trips(self):
+        source = {
+            "schemaVersion": 7,
+            "version": "2026.09.05-dev.30",
+            "contentHash": SHA_A,
+            "fullPackages": [
+                package(self.logical.name, self.logical.size, self.logical.sha256)
+            ],
+            "customField": {"keep": [1, 2, 3]},
+        }
+        digests = [
+            hashlib.sha256(chunk).hexdigest()
+            for chunk in (b"abcd", b"efgh", b"ij")
+        ]
+        segmented = SegmentedAsset(
+            self.logical,
+            segment_layout(self.logical, part_sha256=digests),
+        )
+        derived = build_derived_manifest(
+            source, {self.logical.name: self.logical}, [segmented]
+        )
+        self.assertNotIn("mirrorTransport", source)
+        self.assertEqual(derived["schemaVersion"], 7)
+        self.assertEqual(derived["version"], source["version"])
+        self.assertEqual(derived["contentHash"], source["contentHash"])
+        self.assertEqual(derived["customField"], source["customField"])
+        parsed = parse_mirror_transport(
+            json.loads(serialize_manifest(derived)),
+            {self.logical.name: self.logical},
+        )
+        self.assertEqual(parsed, (segmented,))
+
+    def test_transport_rejects_gap_or_wrong_deterministic_name(self):
+        parts = segment_layout(
+            self.logical,
+            part_sha256=[SHA_A, SHA_B, SHA_C],
+        )
+        segmented = SegmentedAsset(self.logical, parts)
+        derived = build_derived_manifest(
+            {
+                "version": "2026.09.05-dev.30",
+                "contentHash": SHA_A,
+                "fullPackages": [
+                    package(self.logical.name, self.logical.size, self.logical.sha256)
+                ],
+            },
+            {self.logical.name: self.logical},
+            [segmented],
+        )
+        derived["mirrorTransport"]["segmentedAssets"][0]["parts"][1][
+            "offset"
+        ] = 5
+        with self.assertRaisesRegex(MirrorError, "deterministic v1 layout"):
+            parse_mirror_transport(derived, {self.logical.name: self.logical})
+
+    def test_all_oversized_packages_must_be_mapped(self):
+        source = {
+            "version": "2026.09.05-dev.30",
+            "contentHash": SHA_A,
+            "fullPackages": [
+                package(self.logical.name, self.logical.size, self.logical.sha256)
+            ],
+            "mirrorTransport": {
+                "schemaVersion": 1,
+                "segmentSize": 4,
+                "segmentedAssets": [],
+            },
+        }
+        with self.assertRaisesRegex(MirrorError, "every and only oversized"):
+            parse_mirror_transport(source, {self.logical.name: self.logical})
+
+    def test_sync_uploads_parts_not_the_logical_zip(self):
+        client = FakeGiteaClient()
+        source = SourceAsset(
+            self.logical.name,
+            self.logical.size,
+            self.logical.sha256,
+            "https://source.invalid/large.zip",
+        )
+        certifications = {}
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp_root = Path(temp_name)
+            source_path = temp_root / "verified-large.zip"
+            source_path.write_bytes(self.logical_bytes)
+            with patch.object(
+                mirror, "download_source", return_value=source_path
+            ) as download, patch.object(
+                mirror, "verify_public_target"
+            ), patch.object(mirror, "verify_public_canonical"):
+                segmented, results = sync_segmented_logical(
+                    logical=self.logical,
+                    source=source,
+                    published=None,
+                    verify_existing_sha=True,
+                    client=client,
+                    release_id=99,
+                    tag="dev-channel",
+                    existing_assets=client.grouped(),
+                    temp_root=temp_root,
+                    trusted_assets=frozenset(),
+                    certifications=certifications,
+                    cleanup_authorized=True,
+                    published_manifest_count=0,
+                )
+        download.assert_called_once()
+        uploaded_names = [event[2] for event in client.events if event[0] == "upload"]
+        self.assertEqual(len(uploaded_names), len(segmented.parts))
+        self.assertTrue(all(".pending-" in name for name in uploaded_names))
+        renamed_names = [event[2] for event in client.events if event[0] == "rename"]
+        self.assertEqual(renamed_names, [part.spec.name for part in segmented.parts])
+        self.assertNotIn(self.logical.name, uploaded_names)
+        self.assertEqual(len(results), 3)
+
+    def test_published_parts_are_reused_without_source_download(self):
+        part_bytes = (b"abcd", b"efgh", b"ij")
+        parts = segment_layout(
+            self.logical,
+            part_sha256=[hashlib.sha256(value).hexdigest() for value in part_bytes],
+        )
+        published = SegmentedAsset(self.logical, parts)
+        assets = [
+            target(index + 1, part.spec.name, part.spec.size)
+            for index, part in enumerate(parts)
+        ]
+        client = FakeGiteaClient(assets)
+        certifications = {}
+        with tempfile.TemporaryDirectory() as temp_name, patch.object(
+            mirror, "download_source"
+        ) as download, patch.object(mirror, "verify_public_target"):
+            actual, results = sync_segmented_logical(
+                logical=self.logical,
+                source=SourceAsset(
+                    self.logical.name,
+                    self.logical.size,
+                    self.logical.sha256,
+                    "https://source.invalid/large.zip",
+                ),
+                published=published,
+                verify_existing_sha=False,
+                client=client,
+                release_id=99,
+                tag="dev-channel",
+                existing_assets=client.grouped(),
+                temp_root=Path(temp_name),
+                trusted_assets=frozenset(
+                    mirror.asset_trust_key(part.spec) for part in parts
+                ),
+                certifications=certifications,
+                cleanup_authorized=True,
+                published_manifest_count=1,
+            )
+        self.assertEqual(actual, published)
+        self.assertEqual(len(results), 3)
+        download.assert_not_called()
+        self.assertFalse(any(event[0] == "upload" for event in client.events))
+
+    def test_bootstrap_cleanup_is_narrow_and_does_not_sweep_parts(self):
+        incomplete = target(9, self.logical.name, self.logical.size - 1)
+        orphan_part = target(10, "unreferenced-part.bin", 2)
+        client = FakeGiteaClient([incomplete, orphan_part])
+        refreshed = remediate_incomplete_bootstrap_logical(
+            client=client,
+            release_id=99,
+            tag="dev-channel",
+            logical=self.logical,
+            assets=client.grouped(),
+            published_manifest_count=0,
+            cleanup_authorized=True,
+        )
+        self.assertNotIn(self.logical.name, refreshed)
+        self.assertIn(orphan_part.name, refreshed)
+        self.assertEqual(
+            [event for event in client.events if event[0] == "delete"],
+            [("delete", incomplete.id)],
+        )
+
+    def test_bootstrap_cleanup_never_deletes_after_manifest_exists(self):
+        incomplete = target(9, self.logical.name, self.logical.size - 1)
+        client = FakeGiteaClient([incomplete])
+        unchanged = remediate_incomplete_bootstrap_logical(
+            client=client,
+            release_id=99,
+            tag="dev-channel",
+            logical=self.logical,
+            assets=client.grouped(),
+            published_manifest_count=1,
+            cleanup_authorized=True,
+        )
+        self.assertIn(self.logical.name, unchanged)
+        self.assertFalse(any(event[0] == "delete" for event in client.events))
+
+    def test_post_manifest_prune_removes_only_exact_prior_references(self):
+        stale_spec = AssetSpec("old-part.bin", 3, SHA_A, "published")
+        retained_spec = AssetSpec("current-part.bin", 3, SHA_B, "published")
+        stale = target(20, stale_spec.name, stale_spec.size)
+        retained = target(21, retained_spec.name, retained_spec.size)
+        orphan = target(22, "orphan-part.bin", 3)
+        manifest_asset = target(19, "manifest-dev.json", 100)
+        state = PublishedState(
+            manifests=(
+                PublishedManifest(
+                    manifest_asset,
+                    ManifestIdentity("2026.09.05-dev.29", 29, SHA_A, SHA_C),
+                    (stale_spec, retained_spec),
+                ),
+            ),
+            trusted_assets=frozenset(),
+            segmented_assets=(),
+        )
+        client = FakeGiteaClient([stale, retained, orphan])
+        selected = stale_published_candidates(
+            state, client.grouped(), [retained_spec]
+        )
+        self.assertEqual(selected, [(stale, stale_spec)])
+        with tempfile.TemporaryDirectory() as temp_name, patch.object(
+            mirror, "verify_public_target"
+        ) as verify:
+            results = prune_stale_published_assets(
+                client=client,
+                release_id=99,
+                tag="dev-channel",
+                candidates=selected,
+                temp_root=Path(temp_name),
+            )
+        verify.assert_called_once_with(stale, stale_spec, ANY)
+        self.assertEqual(results[0]["result"], "pruned")
+        self.assertNotIn(stale.id, client.assets)
+        self.assertIn(retained.id, client.assets)
+        self.assertIn(orphan.id, client.assets)
+
+    def test_post_manifest_prune_keeps_unverified_prior_asset(self):
+        stale_spec = AssetSpec("old-part.bin", 3, SHA_A, "published")
+        stale = target(20, stale_spec.name, stale_spec.size)
+        client = FakeGiteaClient([stale])
+        with tempfile.TemporaryDirectory() as temp_name, patch.object(
+            mirror,
+            "verify_public_target",
+            side_effect=mirror.AssetIntegrityError("bad bytes"),
+        ):
+            results = prune_stale_published_assets(
+                client=client,
+                release_id=99,
+                tag="dev-channel",
+                candidates=[(stale, stale_spec)],
+                temp_root=Path(temp_name),
+            )
+        self.assertEqual(results[0]["result"], "skipped-unverified")
+        self.assertIn(stale.id, client.assets)
+
+    def test_complete_mirror_publishes_reconstructable_parts_then_manifest(self):
+        manifest = {
+            "schemaVersion": 7,
+            "version": "2026.09.05-dev.30",
+            "contentHash": SHA_A,
+            "fullPackages": [
+                package(self.logical.name, self.logical.size, self.logical.sha256)
+            ],
+            "unchanged": {"preserved": True},
+        }
+        manifest_bytes = json.dumps(manifest).encode("utf-8")
+        manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+        launcher_bytes = b"exe"
+        launcher_digest = hashlib.sha256(launcher_bytes).hexdigest()
+
+        class FakeSourceClient:
+            def __init__(self, *args):
+                self.assets = {
+                    "manifest-dev.json": SourceAsset(
+                        "manifest-dev.json",
+                        len(manifest_bytes),
+                        manifest_digest,
+                        "https://source.invalid/manifest",
+                    ),
+                    "ChroniclesLauncher.exe": SourceAsset(
+                        "ChroniclesLauncher.exe",
+                        len(launcher_bytes),
+                        launcher_digest,
+                        "https://source.invalid/launcher",
+                    ),
+                    self_logical.name: SourceAsset(
+                        self_logical.name,
+                        self_logical.size,
+                        self_logical.sha256,
+                        "https://source.invalid/logical",
+                    ),
+                }
+
+            def load(self):
+                return None
+
+            def require(self, spec):
+                return self.assets[spec.name]
+
+        class FullFakeGitea(FakeGiteaClient):
+            def __init__(self, *args):
+                super().__init__()
+                self.token = "secret"
+
+            def require_public_repo(self):
+                return {"private": False}
+
+            def get_release(self, tag):
+                return {"id": 99}
+
+            def release_assets(self, release):
+                return self.grouped()
+
+            def require_token(self):
+                return self.token
+
+        self_logical = self.logical
+        source_payloads = {
+            "https://source.invalid/manifest": manifest_bytes,
+            "https://source.invalid/launcher": launcher_bytes,
+            "https://source.invalid/logical": self.logical_bytes,
+        }
+
+        def fake_download(url, destination, **kwargs):
+            payload = source_payloads[url]
+            destination.write_bytes(payload)
+            return len(payload), hashlib.sha256(payload).hexdigest()
+
+        target_client = FullFakeGitea()
+        with patch.object(
+            mirror, "GitHubReleaseClient", FakeSourceClient
+        ), patch.object(
+            mirror, "GiteaReleaseClient", return_value=target_client
+        ), patch.object(
+            mirror, "download_file", side_effect=fake_download
+        ), patch.object(
+            mirror, "verify_public_target"
+        ), patch.object(
+            mirror, "verify_public_canonical"
+        ), patch.dict(
+            os.environ, {"GITEA_TOKEN": "secret"}
+        ):
+            self.assertEqual(mirror.main([]), 0)
+
+        rename_events = [event for event in target_client.events if event[0] == "rename"]
+        self.assertEqual(rename_events[-1][2], "manifest-dev.json")
+        self.assertNotIn(self.logical.name, {asset.name for asset in target_client.assets.values()})
+        manifest_asset = next(
+            asset
+            for asset in target_client.assets.values()
+            if asset.name == "manifest-dev.json"
+        )
+        derived = json.loads(target_client.uploaded_payloads[manifest_asset.id])
+        self.assertEqual(derived["schemaVersion"], manifest["schemaVersion"])
+        self.assertEqual(derived["contentHash"], manifest["contentHash"])
+        self.assertEqual(derived["unchanged"], manifest["unchanged"])
+        transport = parse_mirror_transport(
+            derived, {self.logical.name: self.logical}
+        )[0]
+        reconstructed = b"".join(
+            target_client.uploaded_payloads[
+                next(
+                    asset.id
+                    for asset in target_client.assets.values()
+                    if asset.name == part.spec.name
+                )
+            ]
+            for part in transport.parts
+        )
+        self.assertEqual(reconstructed, self.logical_bytes)
+        self.assertEqual(hashlib.sha256(reconstructed).hexdigest(), self.logical.sha256)
 
     def test_public_verification_uses_constructed_uuid_route(self):
         asset = target(42, "asset.zip")
@@ -580,6 +1026,36 @@ class PublishedStateTests(unittest.TestCase):
                     second.download_url: second_bytes,
                 },
             )
+
+    def test_segmented_manifest_trusts_physical_parts_not_logical_zip(self):
+        logical = AssetSpec("large.zip", 10, SHA_A, "fullPackages[0]")
+        with patch.object(mirror, "SEGMENT_SIZE_BYTES", 4):
+            segmented = SegmentedAsset(
+                logical,
+                segment_layout(logical, part_sha256=[SHA_A, SHA_B, SHA_C]),
+            )
+            raw = {
+                "version": "2026.09.05-dev.30",
+                "contentHash": SHA_A,
+                "fullPackages": [package(logical.name, logical.size, logical.sha256)],
+                "mirrorTransport": {
+                    "schemaVersion": 1,
+                    "segmentSize": 4,
+                    "segmentedAssets": [mirror.segmented_asset_json(segmented)],
+                },
+            }
+            payload = serialize_manifest(raw)
+            manifest_asset = target(30, "manifest-dev.json", len(payload))
+            state = self.load(
+                [manifest_asset],
+                {manifest_asset.download_url: payload},
+            )
+        self.assertEqual(state.segmented_assets, (segmented,))
+        self.assertNotIn(mirror.asset_trust_key(logical), state.trusted_assets)
+        self.assertEqual(
+            state.trusted_assets,
+            frozenset(mirror.asset_trust_key(part.spec) for part in segmented.parts),
+        )
 
 
 class ImmutableTrustTests(unittest.TestCase):
@@ -1488,6 +1964,9 @@ class WorkflowSafetyTests(unittest.TestCase):
         self.assertGreaterEqual(workflow.count("persist-credentials: false"), 2)
         self.assertNotIn("source_tag:", workflow)
         self.assertIn("--github-tag dev-2026.08.26.1", workflow)
+        self.assertIn("probe-first-segment", workflow)
+        self.assertNotIn("- probe-largest-full", workflow)
+        self.assertIn("probe-first-segment) args+=(--probe-largest-full)", workflow)
         for action in ("actions/checkout", "actions/setup-python", "actions/upload-artifact"):
             self.assertRegex(workflow, rf"uses: {action}@[0-9a-f]{{40}}")
 
