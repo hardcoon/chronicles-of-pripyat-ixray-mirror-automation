@@ -60,9 +60,13 @@ Duplicate package names must have identical size and SHA-256. Source GitHub
 metadata, manifest size/SHA, the streamed local file, Gitea attachment size,
 and an anonymous full download of every newly uploaded asset are checked.
 Package filenames are immutable: a same-name mismatch aborts instead of
-deleting data. The mutable launcher and manifest use a staged, anonymous
-SHA-verified handover. Gitea permits duplicate attachment names, so a
-replacement is renamed to the canonical name while the previous canonical ID
+deleting data. Every new attachment, including direct packages no larger than
+256 MiB and the direct-package probe edge, is first uploaded under its exact
+transaction-owned `.pending-...` name, verified through its UUID, and only
+then renamed to the canonical name. The mutable launcher and manifest use the
+same staged, anonymous SHA-verified handover. Gitea permits duplicate
+attachment names, so a replacement is renamed to the canonical name while the
+previous canonical ID
 still exists. The previous ID is deleted only after the new ID passes another
 anonymous check through its per-attachment UUID URL. Gitea's API normally
 returns a name-based `browser_download_url`, which is ambiguous during this
@@ -74,9 +78,8 @@ without deduplication or deletion. The stable
 old ID is gone. There is no interval in which an already-published canonical
 name is absent.
 
-The first launcher/manifest upload follows the same protocol: it is uploaded
-under a unique `.pending-...` name and anonymously SHA-verified before its
-single rename makes the canonical name active. If an upload, rename, or delete
+The first launcher/manifest upload follows the same protocol. If an upload,
+rename, or delete
 times out after Gitea actually committed it, the script refreshes the Release
 and reconciles the result by attachment ID. A rerun also repairs a verified
 `.pending-...` upload, duplicate canonical IDs left between rename and delete,
@@ -106,10 +109,12 @@ by the current mutable upload. Package names underneath launcher/manifest
 mutable namespaces are rejected so package data cannot be mistaken for
 transaction state.
 
-One separately narrow bootstrap repair handles the interrupted legacy probe:
-before any target manifest exists, exactly one attachment under an oversized
+One separately narrow bootstrap repair handles interrupted legacy/direct
+uploads: before any target manifest exists, exactly one attachment under a
 logical ZIP name may be deleted only when it is strictly smaller than the
-canonical GitHub ZIP. A complete, oversized, duplicate, post-publication or
+canonical GitHub ZIP. For an oversized pre-segmentation logical package this
+cleanup happens before splitting; for a direct package it happens inside its
+staged transaction. A complete, oversized, duplicate, post-publication or
 otherwise ambiguous logical attachment fails closed or remains untouched.
 
 Transfers are sequential and use one part per Gitea API request. A hosted
@@ -138,6 +143,10 @@ from the beginning on the next run. A published transport map certifies exact
 unchanged parts, allowing later runs to reuse them without re-splitting the
 logical package. Explicit verification re-downloads/hashes the public parts,
 not the source ZIP.
+
+The attachment inventory always follows the dedicated paginated Gitea API
+until it receives an empty page. It does not assume that a short page is the
+end, because a hosted server may cap pages below the requested limit.
 
 ## Authentication and one-time setup
 
@@ -172,6 +181,16 @@ Actions job. It cannot be obtained by a GitHub-hosted job. The public
 gitea.com service also does not supply a hosted runner for this repository, so
 using it would require maintaining a private runner; this rollout therefore
 uses the narrowly scoped PAT above.
+
+The secretless plan job records the exact downloaded canonical-manifest
+SHA-256 and the exact launcher size/SHA-256 as validated job outputs. The write
+job must supply all three back to the script, which validates them before the
+first Gitea read or write. A replacement of either mutable GitHub Release asset
+between jobs therefore aborts the write instead of publishing a mixed source
+snapshot. When new segment hashes are not known until the write job downloads
+the logical ZIP, the plan reports the derived-manifest SHA as `null` with
+`sha256Status: pending-part-hashes`; it never presents a placeholder-based
+digest as final.
 
 Gitea's built-in continuous Git mirror is not used. gitea.com currently
 advertises repository mirrors as disabled, and Git mirroring would not copy

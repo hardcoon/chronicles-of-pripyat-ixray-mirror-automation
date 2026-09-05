@@ -38,6 +38,10 @@ jobs:
        vars.GITEA_MIRROR_SCHEDULE_ENABLED == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    outputs:
+      source_manifest_sha256: ${{ steps.bind_source.outputs.manifest_sha256 }}
+      source_launcher_size: ${{ steps.bind_source.outputs.launcher_size }}
+      source_launcher_sha256: ${{ steps.bind_source.outputs.launcher_sha256 }}
     steps:
       - name: Check out trusted mirror automation
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -85,6 +89,42 @@ jobs:
           fi
           python mirror_release_assets.py "${args[@]}"
 
+      - name: Bind write job to the planned source assets
+        id: bind_source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - "$RUNNER_TEMP/gitea-mirror-plan.json" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import re
+          import sys
+
+          plan_path, output_path = sys.argv[1:]
+          with open(plan_path, encoding="utf-8") as stream:
+              source = json.load(stream)["source"]
+          manifest_sha = source["canonicalManifestSha256"]
+          launcher_size = source["launcherSize"]
+          launcher_sha = source["launcherSha256"]
+          if not isinstance(manifest_sha, str) or not re.fullmatch(
+              r"[0-9a-f]{64}", manifest_sha
+          ):
+              raise SystemExit("planned manifest SHA-256 is invalid")
+          if (
+              isinstance(launcher_size, bool)
+              or not isinstance(launcher_size, int)
+              or launcher_size <= 0
+          ):
+              raise SystemExit("planned launcher size is invalid")
+          if not isinstance(launcher_sha, str) or not re.fullmatch(
+              r"[0-9a-f]{64}", launcher_sha
+          ):
+              raise SystemExit("planned launcher SHA-256 is invalid")
+          with open(output_path, "a", encoding="utf-8") as stream:
+              stream.write(f"manifest_sha256={manifest_sha}\n")
+              stream.write(f"launcher_size={launcher_size}\n")
+              stream.write(f"launcher_sha256={launcher_sha}\n")
+          PY
+
       - name: Save reviewed plan
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -131,6 +171,9 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_OPERATION: ${{ inputs.operation }}
           INPUT_VERIFY_EXISTING_SHA: ${{ inputs.verify_existing_sha }}
+          EXPECTED_SOURCE_MANIFEST_SHA256: ${{ needs.plan.outputs.source_manifest_sha256 }}
+          EXPECTED_SOURCE_LAUNCHER_SIZE: ${{ needs.plan.outputs.source_launcher_size }}
+          EXPECTED_SOURCE_LAUNCHER_SHA256: ${{ needs.plan.outputs.source_launcher_sha256 }}
         shell: bash
         run: |
           set -euo pipefail
@@ -144,6 +187,9 @@ jobs:
             --gitea-url https://gitea.com
             --gitea-repo hardcoon/chronicles-of-pripyat-ixray-downloads
             --gitea-tag dev-channel
+            --expected-source-manifest-sha256 "$EXPECTED_SOURCE_MANIFEST_SHA256"
+            --expected-source-launcher-size "$EXPECTED_SOURCE_LAUNCHER_SIZE"
+            --expected-source-launcher-sha256 "$EXPECTED_SOURCE_LAUNCHER_SHA256"
             --plan-out "$RUNNER_TEMP/gitea-mirror-write-plan.json"
             --receipt-out "$RUNNER_TEMP/gitea-mirror-receipt.json"
           )

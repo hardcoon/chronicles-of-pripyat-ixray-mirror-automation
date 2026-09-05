@@ -613,6 +613,50 @@ def parse_mirror_transport(
     return tuple(result)
 
 
+def validate_expected_source_binding(
+    *,
+    manifest_sha256: str,
+    launcher: AssetSpec,
+    expected_manifest_sha256: str | None,
+    expected_launcher_size: int | None,
+    expected_launcher_sha256: str | None,
+) -> bool:
+    """Bind a write job to the exact mutable GitHub assets seen by plan."""
+
+    values = (
+        expected_manifest_sha256,
+        expected_launcher_size,
+        expected_launcher_sha256,
+    )
+    if all(value is None for value in values):
+        return False
+    if any(value is None for value in values):
+        raise MirrorError(
+            "expected source binding requires manifest SHA-256 plus launcher "
+            "size and SHA-256 together"
+        )
+    expected_manifest = normalize_sha256(
+        expected_manifest_sha256,
+        "--expected-source-manifest-sha256",
+    )
+    expected_launcher_sha = normalize_sha256(
+        expected_launcher_sha256,
+        "--expected-source-launcher-sha256",
+    )
+    expected_size = normalize_size(
+        expected_launcher_size,
+        "--expected-source-launcher-size",
+    )
+    if expected_manifest != manifest_sha256:
+        raise MirrorError("source manifest changed between the plan and write jobs")
+    if (expected_size, expected_launcher_sha) != (
+        launcher.size,
+        launcher.sha256,
+    ):
+        raise MirrorError("source launcher changed between the plan and write jobs")
+    return True
+
+
 def physical_package_specs(
     packages: Mapping[str, AssetSpec],
     segmented: Sequence[SegmentedAsset],
@@ -720,16 +764,25 @@ def planned_action(
     verify_existing_sha: bool,
     trusted_assets: frozenset[tuple[str, int, str]],
     recover_incomplete_immutable: bool = False,
+    stage_new_immutable: bool = False,
 ) -> str:
     if not current:
-        return "stage-verify-publish" if mutable else "upload"
+        return (
+            "stage-verify-publish"
+            if mutable or stage_new_immutable
+            else "upload"
+        )
     if mutable:
         return "verify-or-reconcile"
     if len(current) > 1:
         return "conflict"
     if current[0].size != spec.size:
         if recover_incomplete_immutable and 0 < current[0].size < spec.size:
-            return "delete-incomplete-and-upload"
+            return (
+                "delete-incomplete-and-stage-verify-publish"
+                if stage_new_immutable
+                else "delete-incomplete-and-upload"
+            )
         return "conflict"
     if verify_existing_sha:
         return "verify"
@@ -1122,7 +1175,7 @@ class GiteaReleaseClient:
             raise MirrorError("Gitea release ID must be positive")
         records: list[Any] = []
         page_size = 50
-        for page in range(1, 101):
+        for page in range(1, 102):
             _, payload = request_json(
                 f"{self.api_root}/releases/{release_id}/assets?"
                 + urllib.parse.urlencode({"page": page, "limit": page_size}),
@@ -1130,11 +1183,11 @@ class GiteaReleaseClient:
             )
             if not isinstance(payload, list):
                 raise MirrorError("Gitea release assets response is not an array")
-            records.extend(payload)
-            if len(payload) < page_size:
+            if not payload:
                 break
+            records.extend(payload)
         else:
-            raise MirrorError("Gitea release asset pagination exceeded 5000 entries")
+            raise MirrorError("Gitea release asset pagination exceeded 5050 entries")
         return self._group_asset_records(records)
 
     def refresh_assets(self, tag: str) -> tuple[Mapping[str, Any], TargetAssets]:
@@ -2019,7 +2072,7 @@ def sync_asset(
                 f"expected {spec.size}. Refusing destructive replacement."
             )
         print(
-            f"deleting incomplete bootstrap probe: {spec.name} "
+            f"deleting incomplete bootstrap immutable asset: {spec.name} "
             f"({existing.size}/{spec.size} bytes)"
         )
         delete_with_reconciliation(
@@ -2032,7 +2085,8 @@ def sync_asset(
         candidates = target_candidates(existing_assets, spec.name)
         if candidates:
             raise MirrorError(
-                f"incomplete bootstrap probe {spec.name} remained after deletion"
+                f"incomplete bootstrap immutable asset {spec.name} remained "
+                "after deletion"
             )
         existing = None
     if not mutable and existing is not None and existing.size == spec.size:
@@ -2413,6 +2467,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--launcher-name", default=DEFAULT_LAUNCHER_NAME)
     parser.add_argument("--github-token-env", default="GITHUB_TOKEN")
     parser.add_argument("--gitea-token-env", default="GITEA_TOKEN")
+    parser.add_argument("--expected-source-manifest-sha256")
+    parser.add_argument("--expected-source-launcher-size", type=int)
+    parser.add_argument("--expected-source-launcher-sha256")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--allow-rollback",
@@ -2474,7 +2531,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     launcher_source = source_client.assets.get(launcher_name)
     if manifest_source is None:
         raise MirrorError("source Release must contain the manifest asset")
-    if not args.probe_largest_full and launcher_source is None:
+    if launcher_source is None:
         raise MirrorError("source Release must contain the launcher asset")
 
     with tempfile.TemporaryDirectory(prefix="cop-gitea-mirror-") as temp_name:
@@ -2512,30 +2569,42 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{args.max_asset_bytes}"
                 )
 
-        launcher_spec: AssetSpec | None = None
+        assert launcher_source is not None
+        if launcher_source.sha256 is None:
+            launcher_path = temp_root / f"probe-{launcher_name}"
+            try:
+                _, launcher_digest = download_file(
+                    launcher_source.download_url,
+                    launcher_path,
+                    expected_size=launcher_source.size,
+                    expected_sha256=None,
+                )
+            finally:
+                launcher_path.unlink(missing_ok=True)
+        else:
+            launcher_digest = launcher_source.sha256
+        launcher_spec = AssetSpec(
+            launcher_name, launcher_source.size, launcher_digest, "launcher"
+        )
+        source_binding_checked = validate_expected_source_binding(
+            manifest_sha256=manifest_digest,
+            launcher=launcher_spec,
+            expected_manifest_sha256=args.expected_source_manifest_sha256,
+            expected_launcher_size=args.expected_source_launcher_size,
+            expected_launcher_sha256=args.expected_source_launcher_sha256,
+        )
+        if not args.dry_run and not source_binding_checked:
+            raise MirrorError(
+                "write operations require the exact source manifest and launcher "
+                "binding produced by a reviewed plan"
+            )
+
         probe_logical: AssetSpec | None = None
         if args.probe_largest_full:
             probe_logical = largest_full_package(manifest)
             source_client.require(probe_logical)
             operation = "first-segment-probe"
         else:
-            assert launcher_source is not None
-            if launcher_source.sha256 is None:
-                launcher_path = temp_root / f"probe-{launcher_name}"
-                try:
-                    _, launcher_digest = download_file(
-                        launcher_source.download_url,
-                        launcher_path,
-                        expected_size=launcher_source.size,
-                        expected_sha256=None,
-                    )
-                finally:
-                    launcher_path.unlink(missing_ok=True)
-            else:
-                launcher_digest = launcher_source.sha256
-            launcher_spec = AssetSpec(
-                launcher_name, launcher_source.size, launcher_digest, "launcher"
-            )
             operation = "segmented-mirror"
 
         target_client = GiteaReleaseClient(args.gitea_url, args.gitea_repo, gitea_token)
@@ -2592,7 +2661,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             provisional_manifest_bytes = b""
             plan_specs = list(plan_package_specs)
         else:
-            assert launcher_spec is not None
             provisional_manifest = build_derived_manifest(
                 manifest,
                 package_specs,
@@ -2642,15 +2710,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             for item in published_state.segmented_assets
             for part in item.parts
         }
+        derived_manifest_digest_known = all(
+            part.spec.sha256 != PLACEHOLDER_SHA256
+            for item in provisional_segmented
+            for part in item.parts
+        )
         for spec in plan_specs:
             current = target_candidates(target_assets, spec.name)
             mutable = spec.kind in {"launcher", "derived-manifest-last"}
             digest_known = (
-                spec.name not in segmented_part_names
-                or spec.name in known_part_digests
+                derived_manifest_digest_known
+                if spec.kind == "derived-manifest-last"
+                else (
+                    spec.name not in segmented_part_names
+                    or spec.name in known_part_digests
+                )
             )
             if spec.kind == "derived-manifest-last":
-                action = "stage-derived-manifest-last"
+                action = (
+                    "stage-derived-manifest-last"
+                    if digest_known
+                    else "stage-derived-manifest-last-after-parts-hashed"
+                )
             elif not digest_known:
                 if len(current) > 1 or (
                     current and current[0].size != spec.size
@@ -2659,14 +2740,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 elif current:
                     action = "hash-source-part-and-verify"
                 else:
-                    action = "hash-source-part-and-upload"
+                    action = "hash-source-part-and-stage-verify-publish"
             else:
+                recover_incomplete_direct = (
+                    not published_state.manifests
+                    and not mutable
+                    and spec.name not in segmented_part_names
+                )
                 action = planned_action(
                     spec,
                     current,
                     mutable=mutable,
                     verify_existing_sha=verify_existing_sha,
                     trusted_assets=published_state.trusted_assets,
+                    recover_incomplete_immutable=recover_incomplete_direct,
+                    stage_new_immutable=not mutable,
                 )
             actions.append(
                 {
@@ -2674,6 +2762,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "kind": spec.kind,
                     "size": spec.size,
                     "sha256": spec.sha256 if digest_known else None,
+                    "sha256Status": (
+                        "known" if digest_known else "pending-part-hashes"
+                    ),
                     "action": action,
                     "targetCanonicalCount": len(current),
                 }
@@ -2727,6 +2818,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "repository": args.github_repo,
                 "tag": args.github_tag,
                 "canonicalManifestSha256": manifest_digest,
+                "launcherSize": launcher_spec.size,
+                "launcherSha256": launcher_spec.sha256,
             },
             "target": {
                 "baseUrl": args.gitea_url,
@@ -2741,6 +2834,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "contentHash": content_hash,
             "manifestProgression": progression,
             "rollbackOverride": allow_rollback,
+            "sourceBindingChecked": source_binding_checked,
             "bootstrapRequiresExistingSha": bootstrap_sha_verification,
             "effectiveVerifyExistingSha": verify_existing_sha,
             "transportSchemaVersion": MIRROR_TRANSPORT_SCHEMA_VERSION,
@@ -2818,6 +2912,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     trusted_assets=published_state.trusted_assets,
                     certifications=certifications,
                     cleanup_authorized=cleanup_authorized_for_progression(progression),
+                    recover_incomplete_immutable=not published_state.manifests,
+                    stage_new_immutable=True,
                 )
             results.append(
                 {
@@ -2895,11 +2991,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 trusted_assets=published_state.trusted_assets,
                 certifications=certifications,
                 cleanup_authorized=cleanup_authorized_for_progression(progression),
+                recover_incomplete_immutable=not published_state.manifests,
+                stage_new_immutable=True,
             )
             physical_specs.append(logical)
             results.append({"name": logical.name, "result": result})
 
-        assert launcher_spec is not None and launcher_source is not None
         _, target_assets = target_client.refresh_assets(args.gitea_tag)
         latest_state = load_published_state(
             target_client,

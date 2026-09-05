@@ -411,12 +411,43 @@ class ManifestAssetsTests(unittest.TestCase):
             (200, [record(index) for index in range(1, 51)]),
             (200, [record(index) for index in range(51, 101)]),
             (200, [record(index) for index in range(101, 104)]),
+            (200, []),
         ]
         with patch.object(mirror, "request_json", side_effect=pages) as request:
             assets = client.release_assets({"id": 99, "assets": []})
         self.assertEqual(sum(map(len, assets.values())), 103)
-        self.assertEqual(request.call_count, 3)
-        self.assertIn("page=3&limit=50", request.call_args.args[0])
+        self.assertEqual(request.call_count, 4)
+        self.assertIn("page=4&limit=50", request.call_args.args[0])
+
+    def test_gitea_asset_listing_does_not_treat_server_capped_page_as_eof(self):
+        client = GiteaReleaseClient(
+            "https://example.invalid", "owner/repo", token=None
+        )
+
+        def record(asset_id):
+            return {
+                "id": asset_id,
+                "uuid": f"00000000-0000-0000-0000-{asset_id:012x}",
+                "name": f"part-{asset_id:03d}.bin",
+                "size": 3,
+                "browser_download_url": (
+                    "https://example.invalid/releases/download/dev-channel/"
+                    f"part-{asset_id:03d}.bin"
+                ),
+            }
+
+        # The client requests 50, but this simulated server caps every page at 2.
+        pages = [
+            (200, [record(1), record(2)]),
+            (200, [record(3), record(4)]),
+            (200, [record(5)]),
+            (200, []),
+        ]
+        with patch.object(mirror, "request_json", side_effect=pages) as request:
+            assets = client.release_assets({"id": 99, "assets": []})
+        self.assertEqual(sum(map(len, assets.values())), 5)
+        self.assertEqual(request.call_count, 4)
+        self.assertIn("page=4&limit=50", request.call_args.args[0])
 
 
 class SegmentedTransportTests(unittest.TestCase):
@@ -704,6 +735,111 @@ class SegmentedTransportTests(unittest.TestCase):
         self.assertEqual(results[0]["result"], "skipped-unverified")
         self.assertIn(stale.id, client.assets)
 
+    def test_direct_probe_recovers_short_canonical_then_stages_and_renames(self):
+        payload = b"abc"
+        logical = AssetSpec(
+            "small.zip",
+            len(payload),
+            hashlib.sha256(payload).hexdigest(),
+            "fullPackages[0]",
+        )
+        manifest = {
+            "version": "2026.09.05-dev.30",
+            "contentHash": SHA_A,
+            "fullPackages": [package(logical.name, logical.size, logical.sha256)],
+        }
+        manifest_bytes = json.dumps(manifest).encode("utf-8")
+        manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+
+        class FakeSourceClient:
+            def __init__(self, *args):
+                self.assets = {
+                    "manifest-dev.json": SourceAsset(
+                        "manifest-dev.json",
+                        len(manifest_bytes),
+                        manifest_digest,
+                        "https://source.invalid/manifest",
+                    ),
+                    "ChroniclesLauncher.exe": SourceAsset(
+                        "ChroniclesLauncher.exe", 3, SHA_B,
+                        "https://source.invalid/launcher",
+                    ),
+                    logical.name: SourceAsset(
+                        logical.name,
+                        logical.size,
+                        logical.sha256,
+                        "https://source.invalid/small",
+                    ),
+                }
+
+            def load(self):
+                return None
+
+            def require(self, spec):
+                return self.assets[spec.name]
+
+        class ProbeFakeGitea(FakeGiteaClient):
+            def __init__(self, *args):
+                super().__init__([target(7, logical.name, logical.size - 1)])
+                self.token = "secret"
+
+            def require_public_repo(self):
+                return {"private": False}
+
+            def get_release(self, tag):
+                return {"id": 99}
+
+            def release_assets(self, release):
+                return self.grouped()
+
+            def require_token(self):
+                return self.token
+
+        source_payloads = {
+            "https://source.invalid/manifest": manifest_bytes,
+            "https://source.invalid/small": payload,
+        }
+
+        def fake_download(url, destination, **kwargs):
+            value = source_payloads[url]
+            destination.write_bytes(value)
+            return len(value), hashlib.sha256(value).hexdigest()
+
+        client = ProbeFakeGitea()
+        with patch.object(
+            mirror, "GitHubReleaseClient", FakeSourceClient
+        ), patch.object(
+            mirror, "GiteaReleaseClient", return_value=client
+        ), patch.object(
+            mirror, "download_file", side_effect=fake_download
+        ), patch.object(mirror, "verify_public_target"), patch.object(
+            mirror, "verify_public_canonical"
+        ), patch.dict(os.environ, {"GITEA_TOKEN": "secret"}):
+            self.assertEqual(
+                mirror.main(
+                    [
+                        "--probe-largest-full",
+                        "--expected-source-manifest-sha256",
+                        manifest_digest,
+                        "--expected-source-launcher-size",
+                        "3",
+                        "--expected-source-launcher-sha256",
+                        SHA_B,
+                    ]
+                ),
+                0,
+            )
+
+        self.assertIn(("delete", 7), client.events)
+        upload = next(event for event in client.events if event[0] == "upload")
+        self.assertTrue(upload[2].startswith(f"{logical.name}.pending-"))
+        self.assertIn(("rename", upload[1], logical.name), client.events)
+        self.assertFalse(any(
+            event[0] == "upload" and event[2] == logical.name
+            for event in client.events
+        ))
+        self.assertEqual(client.assets[upload[1]].name, logical.name)
+
     def test_complete_mirror_publishes_reconstructable_parts_then_manifest(self):
         manifest = {
             "schemaVersion": 7,
@@ -778,20 +914,50 @@ class SegmentedTransportTests(unittest.TestCase):
             return len(payload), hashlib.sha256(payload).hexdigest()
 
         target_client = FullFakeGitea()
-        with patch.object(
-            mirror, "GitHubReleaseClient", FakeSourceClient
-        ), patch.object(
-            mirror, "GiteaReleaseClient", return_value=target_client
-        ), patch.object(
-            mirror, "download_file", side_effect=fake_download
-        ), patch.object(
-            mirror, "verify_public_target"
-        ), patch.object(
-            mirror, "verify_public_canonical"
-        ), patch.dict(
-            os.environ, {"GITEA_TOKEN": "secret"}
-        ):
-            self.assertEqual(mirror.main([]), 0)
+        with tempfile.TemporaryDirectory() as plan_name:
+            plan_path = Path(plan_name) / "plan.json"
+            with patch.object(
+                mirror, "GitHubReleaseClient", FakeSourceClient
+            ), patch.object(
+                mirror, "GiteaReleaseClient", return_value=target_client
+            ), patch.object(
+                mirror, "download_file", side_effect=fake_download
+            ), patch.object(
+                mirror, "verify_public_target"
+            ), patch.object(
+                mirror, "verify_public_canonical"
+            ), patch.dict(
+                os.environ, {"GITEA_TOKEN": "secret"}
+            ):
+                self.assertEqual(
+                    mirror.main(
+                        [
+                            "--plan-out",
+                            str(plan_path),
+                            "--expected-source-manifest-sha256",
+                            manifest_digest,
+                            "--expected-source-launcher-size",
+                            str(len(launcher_bytes)),
+                            "--expected-source-launcher-sha256",
+                            launcher_digest,
+                        ]
+                    ),
+                    0,
+                )
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(plan["sourceBindingChecked"])
+        manifest_action = next(
+            action
+            for action in plan["actions"]
+            if action["kind"] == "derived-manifest-last"
+        )
+        self.assertIsNone(manifest_action["sha256"])
+        self.assertEqual(manifest_action["sha256Status"], "pending-part-hashes")
+        self.assertEqual(
+            manifest_action["action"],
+            "stage-derived-manifest-last-after-parts-hashed",
+        )
 
         rename_events = [event for event in target_client.events if event[0] == "rename"]
         self.assertEqual(rename_events[-1][2], "manifest-dev.json")
@@ -1142,8 +1308,9 @@ class ImmutableTrustTests(unittest.TestCase):
                 verify_existing_sha=True,
                 trusted_assets=frozenset(),
                 recover_incomplete_immutable=True,
+                stage_new_immutable=True,
             ),
-            "delete-incomplete-and-upload",
+            "delete-incomplete-and-stage-verify-publish",
         )
         self.assertEqual(
             planned_action(
@@ -1165,7 +1332,9 @@ class ImmutableTrustTests(unittest.TestCase):
         certifications = {}
         with patch.object(
             mirror, "download_source", return_value=source_path
-        ), patch.object(mirror, "verify_public_target"):
+        ), patch.object(mirror, "verify_public_target"), patch.object(
+            mirror, "verify_public_canonical"
+        ):
             result = sync_asset(
                 spec=self.spec,
                 source=self.source,
@@ -1180,10 +1349,47 @@ class ImmutableTrustTests(unittest.TestCase):
                 certifications=certifications,
                 cleanup_authorized=True,
                 recover_incomplete_immutable=True,
+                stage_new_immutable=True,
             )
         self.assertEqual(result, "uploaded")
         self.assertEqual(events[0], ("delete", incomplete.id))
-        self.assertEqual(events[2][0], "upload")
+        upload = events[2]
+        self.assertEqual(upload[0], "upload")
+        self.assertTrue(upload[2].startswith(f"{self.spec.name}.pending-"))
+        self.assertIn(("rename", upload[1], self.spec.name), events)
+        self.assertEqual(client.assets[upload[1]].name, self.spec.name)
+
+    def test_interrupted_new_direct_upload_reconciles_pending_before_rename(self):
+        events = []
+        client = FakeGiteaClient(events=events, upload_failure="after")
+        source_path = self.temp_root / "source-direct.zip"
+        source_path.write_bytes(b"new")
+        with patch.object(
+            mirror, "download_source", return_value=source_path
+        ), patch.object(mirror, "verify_public_target"), patch.object(
+            mirror, "verify_public_canonical"
+        ), patch.object(mirror.time, "sleep"):
+            result = sync_asset(
+                spec=self.spec,
+                source=self.source,
+                mutable=False,
+                verify_existing_sha=True,
+                client=client,
+                release_id=99,
+                tag="dev-channel",
+                existing_assets={},
+                temp_root=self.temp_root,
+                trusted_assets=frozenset(),
+                certifications={},
+                cleanup_authorized=True,
+                stage_new_immutable=True,
+            )
+        self.assertEqual(result, "uploaded")
+        upload = next(event for event in events if event[0] == "upload")
+        self.assertTrue(upload[2].startswith(f"{self.spec.name}.pending-"))
+        self.assertIn(("rename", upload[1], self.spec.name), events)
+        self.assertEqual(list(client.assets), [upload[1]])
+        self.assertEqual(client.assets[upload[1]].name, self.spec.name)
 
     def test_different_published_sha_does_not_trust_same_name_and_size(self):
         prior = AssetSpec(self.spec.name, self.spec.size, SHA_B, "published")
@@ -1229,6 +1435,7 @@ class ImmutableTrustTests(unittest.TestCase):
                     trusted_assets=frozenset(),
                     certifications={},
                     cleanup_authorized=True,
+                    stage_new_immutable=True,
                 )
         self.assertEqual(len(client.assets), 1)
         self.assertFalse(any(event[0] == "delete" for event in events))
@@ -1880,6 +2087,92 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(size, 3)
 
 
+class SourceBindingTests(unittest.TestCase):
+    def setUp(self):
+        self.launcher = AssetSpec("ChroniclesLauncher.exe", 3, SHA_B, "launcher")
+
+    def validate(self, **overrides):
+        values = {
+            "manifest_sha256": SHA_A,
+            "launcher": self.launcher,
+            "expected_manifest_sha256": SHA_A,
+            "expected_launcher_size": 3,
+            "expected_launcher_sha256": SHA_B,
+        }
+        values.update(overrides)
+        return mirror.validate_expected_source_binding(**values)
+
+    def test_exact_plan_binding_is_accepted(self):
+        self.assertTrue(self.validate())
+
+    def test_absent_plan_binding_remains_optional_for_local_read_only_use(self):
+        self.assertFalse(
+            self.validate(
+                expected_manifest_sha256=None,
+                expected_launcher_size=None,
+                expected_launcher_sha256=None,
+            )
+        )
+
+    def test_partial_plan_binding_is_rejected(self):
+        with self.assertRaisesRegex(MirrorError, "requires manifest SHA-256"):
+            self.validate(expected_launcher_sha256=None)
+
+    def test_changed_manifest_or_launcher_is_rejected(self):
+        with self.assertRaisesRegex(MirrorError, "manifest changed"):
+            self.validate(expected_manifest_sha256=SHA_C)
+        with self.assertRaisesRegex(MirrorError, "launcher changed"):
+            self.validate(expected_launcher_size=4)
+        with self.assertRaisesRegex(MirrorError, "launcher changed"):
+            self.validate(expected_launcher_sha256=SHA_C)
+
+    def test_write_without_reviewed_binding_fails_before_gitea_access(self):
+        manifest_bytes = json.dumps(
+            {
+                "version": "2026.09.05-dev.30",
+                "contentHash": SHA_A,
+                "fullPackages": [],
+            }
+        ).encode("utf-8")
+        manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+
+        class FakeSourceClient:
+            def __init__(self, *args):
+                self.assets = {
+                    "manifest-dev.json": SourceAsset(
+                        "manifest-dev.json",
+                        len(manifest_bytes),
+                        manifest_digest,
+                        "https://source.invalid/manifest",
+                    ),
+                    "ChroniclesLauncher.exe": SourceAsset(
+                        "ChroniclesLauncher.exe",
+                        3,
+                        SHA_B,
+                        "https://source.invalid/launcher",
+                    ),
+                }
+
+            def load(self):
+                return None
+
+            def require(self, spec):
+                return self.assets[spec.name]
+
+        def fake_download(url, destination, **kwargs):
+            destination.write_bytes(manifest_bytes)
+            return len(manifest_bytes), manifest_digest
+
+        with patch.object(
+            mirror, "GitHubReleaseClient", FakeSourceClient
+        ), patch.object(mirror, "GiteaReleaseClient") as gitea, patch.object(
+            mirror, "download_file", side_effect=fake_download
+        ):
+            with self.assertRaisesRegex(MirrorError, "reviewed plan"):
+                mirror.main([])
+        gitea.assert_not_called()
+
+
 class WorkflowSafetyTests(unittest.TestCase):
     def test_non_default_source_tag_is_rejected_before_write_mode_network(self):
         with patch.dict(
@@ -1957,6 +2250,33 @@ class WorkflowSafetyTests(unittest.TestCase):
         self.assertIn("${{ secrets.GITEA_TOKEN }}", write_job)
         self.assertEqual(workflow.count("${{ secrets.GITEA_TOKEN }}"), 1)
         self.assertIn("needs: plan", write_job)
+        self.assertIn("source_manifest_sha256: ${{ steps.bind_source.outputs.manifest_sha256 }}", plan_job)
+        self.assertIn("source_launcher_size: ${{ steps.bind_source.outputs.launcher_size }}", plan_job)
+        self.assertIn("source_launcher_sha256: ${{ steps.bind_source.outputs.launcher_sha256 }}", plan_job)
+        self.assertIn(
+            "EXPECTED_SOURCE_MANIFEST_SHA256: ${{ needs.plan.outputs.source_manifest_sha256 }}",
+            write_job,
+        )
+        self.assertIn(
+            "EXPECTED_SOURCE_LAUNCHER_SIZE: ${{ needs.plan.outputs.source_launcher_size }}",
+            write_job,
+        )
+        self.assertIn(
+            "EXPECTED_SOURCE_LAUNCHER_SHA256: ${{ needs.plan.outputs.source_launcher_sha256 }}",
+            write_job,
+        )
+        self.assertIn(
+            '--expected-source-manifest-sha256 "$EXPECTED_SOURCE_MANIFEST_SHA256"',
+            write_job,
+        )
+        self.assertIn(
+            '--expected-source-launcher-size "$EXPECTED_SOURCE_LAUNCHER_SIZE"',
+            write_job,
+        )
+        self.assertIn(
+            '--expected-source-launcher-sha256 "$EXPECTED_SOURCE_LAUNCHER_SHA256"',
+            write_job,
+        )
         self.assertIn("github.ref == 'refs/heads/main'", plan_job)
         self.assertIn("github.ref == 'refs/heads/main'", write_job)
         self.assertIn("name: gitea-production", write_job)
