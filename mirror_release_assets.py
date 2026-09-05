@@ -36,6 +36,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 USER_AGENT = "chronicles-of-pripyat-gitea-mirror/1.0"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+DEV_VERSION_RE = re.compile(r"^(?P<date>\d{4}\.\d{2}\.\d{2})-dev\.(?P<number>[1-9]\d*)$")
 DEFAULT_SOURCE_REPO = "hardcoon/chronicles-of-pripyat-ixray"
 DEFAULT_SOURCE_TAG = "dev-2026.08.26.1"
 DEFAULT_TARGET_REPO = "hardcoon/chronicles-of-pripyat-ixray-downloads"
@@ -43,6 +44,8 @@ DEFAULT_GITEA_URL = "https://gitea.com"
 DEFAULT_TARGET_TAG = "dev-channel"
 DEFAULT_MANIFEST_NAME = "manifest-dev.json"
 DEFAULT_LAUNCHER_NAME = "ChroniclesLauncher.exe"
+ROLLBACK_GUARD_ENV = "GITEA_MIRROR_ROLLBACK_ENABLED"
+MAX_PUBLISHED_MANIFEST_BYTES = 32 * 1024 * 1024
 PACKAGE_FIELDS = ("fullPackages", "deltaPackages", "initialPackages")
 
 
@@ -72,6 +75,17 @@ class TargetAsset:
     name: str
     size: int
     download_url: str
+
+
+TargetAssets = dict[str, list[TargetAsset]]
+
+
+@dataclasses.dataclass(frozen=True)
+class ManifestIdentity:
+    version: str
+    dev_number: int
+    content_hash: str
+    sha256: str
 
 
 def normalize_sha256(value: Any, field: str) -> str:
@@ -107,6 +121,83 @@ def normalize_size(value: Any, field: str) -> int:
     if size <= 0:
         raise MirrorError(f"{field} must be greater than zero")
     return size
+
+
+def manifest_identity(
+    manifest: Mapping[str, Any], digest: str, field: str
+) -> ManifestIdentity:
+    version_value = manifest.get("version")
+    if not isinstance(version_value, str) or not version_value.strip():
+        raise MirrorError(f"{field}.version must be a non-empty string")
+    version = version_value.strip()
+    match = DEV_VERSION_RE.fullmatch(version)
+    if match is None:
+        raise MirrorError(
+            f"{field}.version must use YYYY.MM.DD-dev.N with a positive global N"
+        )
+    return ManifestIdentity(
+        version=version,
+        dev_number=int(match.group("number")),
+        content_hash=normalize_sha256(
+            manifest.get("contentHash"), f"{field}.contentHash"
+        ),
+        sha256=normalize_sha256(digest, f"{field} SHA-256"),
+    )
+
+
+def validate_manifest_progression(
+    source: ManifestIdentity,
+    published: Sequence[ManifestIdentity],
+    *,
+    allow_rollback: bool,
+) -> str:
+    """Fail closed when a source manifest could roll back the dev channel."""
+
+    if not published:
+        return "bootstrap"
+    newest_number = max(item.dev_number for item in published)
+    newest = [item for item in published if item.dev_number == newest_number]
+    if source.dev_number > newest_number:
+        return "advance"
+    if source.dev_number == newest_number and all(
+        item.content_hash == source.content_hash for item in newest
+    ):
+        return "idempotent"
+    if allow_rollback:
+        return "guarded-rollback"
+    if source.dev_number < newest_number:
+        detail = (
+            f"source {source.version} has dev.{source.dev_number}, but the target "
+            f"already contains dev.{newest_number}"
+        )
+    else:
+        detail = (
+            f"source {source.version} reuses dev.{source.dev_number} with a different "
+            "contentHash"
+        )
+    raise MirrorError(
+        f"refusing target manifest rollback/non-idempotent rewrite: {detail}"
+    )
+
+
+def rollback_override_enabled(
+    requested: bool, environment: Mapping[str, str]
+) -> bool:
+    if not requested:
+        return False
+    if environment.get(ROLLBACK_GUARD_ENV) != "true":
+        raise MirrorError(
+            f"--allow-rollback also requires {ROLLBACK_GUARD_ENV}=true"
+        )
+    return True
+
+
+def effective_existing_sha_verification(
+    *, requested: bool, probe: bool, published_manifest_count: int
+) -> bool:
+    # Before a canonical manifest exists, no target package has inherited trust
+    # from an earlier completed mirror.  Bootstrap therefore always hashes it.
+    return requested or probe or published_manifest_count == 0
 
 
 def as_object_list(value: Any, field: str) -> list[Mapping[str, Any]]:
@@ -217,6 +308,30 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def validate_content_range(
+    value: str | None, *, offset: int, expected_size: int | None
+) -> None:
+    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+|\*)", value or "")
+    if match is None:
+        raise MirrorError("resumed download returned an invalid Content-Range")
+    start, end = int(match.group(1)), int(match.group(2))
+    if start != offset or end < start:
+        raise MirrorError(
+            f"resumed download returned Content-Range {value!r} for offset {offset}"
+        )
+    total_text = match.group(3)
+    if expected_size is not None:
+        if total_text == "*" or int(total_text) != expected_size:
+            raise MirrorError(
+                f"resumed download returned Content-Range {value!r}; "
+                f"expected total {expected_size}"
+            )
+        if end >= expected_size:
+            raise MirrorError(
+                f"resumed download returned Content-Range {value!r} beyond the file"
+            )
+
+
 def request_json(
     url: str,
     *,
@@ -272,6 +387,9 @@ def download_file(
     for attempt in range(attempts):
         try:
             offset = partial.stat().st_size if partial.exists() else 0
+            if expected_size is not None and offset > expected_size:
+                partial.unlink()
+                offset = 0
             headers = {"User-Agent": USER_AGENT, "Accept": "application/octet-stream"}
             if offset:
                 headers["Range"] = f"bytes={offset}-"
@@ -287,11 +405,22 @@ def download_file(
             if response is not None:
                 with response:
                     status = response.status
-                    if offset and status != 206:
+                    if offset and status == 206:
+                        validate_content_range(
+                            response.headers.get("Content-Range"),
+                            offset=offset,
+                            expected_size=expected_size,
+                        )
+                        mode = "ab"
+                    elif status == 200:
+                        # A server may ignore Range.  Replacing the partial file
+                        # with the complete 200 response is safe.
                         offset = 0
                         mode = "wb"
                     else:
-                        mode = "ab" if offset else "wb"
+                        raise MirrorError(
+                            f"download returned unexpected HTTP {status} at offset {offset}"
+                        )
                     with partial.open(mode) as output:
                         shutil.copyfileobj(response, output, length=8 * 1024 * 1024)
 
@@ -309,11 +438,20 @@ def download_file(
                 )
             os.replace(partial, destination)
             return size, digest
-        except (OSError, urllib.error.URLError, MirrorError) as exc:
+        except (
+            OSError,
+            http.client.HTTPException,
+            urllib.error.URLError,
+            MirrorError,
+        ) as exc:
             last_error = exc
-            if isinstance(exc, MirrorError) and "SHA-256 mismatch" in str(exc):
+            if isinstance(exc, MirrorError) and (
+                "SHA-256 mismatch" in str(exc)
+                or "Content-Range" in str(exc)
+            ):
                 partial.unlink(missing_ok=True)
-                break
+                if "SHA-256 mismatch" in str(exc):
+                    break
             if attempt + 1 < attempts:
                 time.sleep(min(2**attempt, 20))
     raise MirrorError(f"download failed for {url}: {last_error}")
@@ -411,6 +549,14 @@ class GiteaReleaseClient:
     def auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"token {self.token}"} if self.token else {}
 
+    def canonical_download_url(self, tag: str, name: str) -> str:
+        encoded_tag = urllib.parse.quote(tag, safe="")
+        encoded_name = urllib.parse.quote(validate_asset_name(name), safe="")
+        return (
+            f"{self.base_url}/{self.owner}/{self.repo}/releases/download/"
+            f"{encoded_tag}/{encoded_name}"
+        )
+
     def require_public_repo(self) -> Mapping[str, Any]:
         _, repo = request_json(self.api_root, headers=self.auth_headers)
         if not isinstance(repo, Mapping):
@@ -461,8 +607,8 @@ class GiteaReleaseClient:
         return self.token
 
     @staticmethod
-    def release_assets(release: Mapping[str, Any]) -> dict[str, TargetAsset]:
-        result: dict[str, TargetAsset] = {}
+    def release_assets(release: Mapping[str, Any]) -> TargetAssets:
+        result: TargetAssets = {}
         raw_assets = release.get("assets") or []
         if not isinstance(raw_assets, list):
             raise MirrorError("Gitea release assets field is invalid")
@@ -470,17 +616,18 @@ class GiteaReleaseClient:
             if not isinstance(raw, Mapping):
                 raise MirrorError("Gitea release contains an invalid asset record")
             name = validate_asset_name(raw.get("name"), "Gitea asset name")
-            if name in result:
-                raise MirrorError(f"duplicate Gitea attachment name: {name}")
-            result[name] = TargetAsset(
+            asset = TargetAsset(
                 id=int(raw["id"]),
                 name=name,
                 size=int(raw["size"]),
                 download_url=str(raw.get("browser_download_url") or ""),
             )
+            result.setdefault(name, []).append(asset)
+        for assets in result.values():
+            assets.sort(key=lambda item: item.id)
         return result
 
-    def refresh_assets(self, tag: str) -> tuple[Mapping[str, Any], dict[str, TargetAsset]]:
+    def refresh_assets(self, tag: str) -> tuple[Mapping[str, Any], TargetAssets]:
         release = self.get_release(tag)
         if release is None:
             raise MirrorError("Gitea release disappeared during synchronization")
@@ -546,6 +693,8 @@ class GiteaReleaseClient:
                 f"Gitea upload metadata mismatch for {target_name}: "
                 f"name={uploaded.name!r}, size={uploaded.size}"
             )
+        if not uploaded.download_url.startswith("https://"):
+            raise MirrorError(f"Gitea upload of {target_name} returned an unsafe URL")
         return uploaded
 
     def rename(self, release_id: int, asset_id: int, name: str) -> TargetAsset:
@@ -560,12 +709,21 @@ class GiteaReleaseClient:
         )
         if not isinstance(raw, Mapping):
             raise MirrorError("Gitea rename response is invalid")
-        return TargetAsset(
-            id=int(raw["id"]),
-            name=str(raw["name"]),
-            size=int(raw["size"]),
-            download_url=str(raw["browser_download_url"]),
-        )
+        try:
+            renamed = TargetAsset(
+                id=int(raw["id"]),
+                name=validate_asset_name(raw["name"], "renamed asset name"),
+                size=int(raw["size"]),
+                download_url=str(raw["browser_download_url"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MirrorError("Gitea rename response is invalid") from exc
+        if renamed.id != asset_id or renamed.name != name:
+            raise MirrorError(
+                f"Gitea rename metadata mismatch for attachment {asset_id}: "
+                f"name={renamed.name!r}"
+            )
+        return renamed
 
     def delete(self, release_id: int, asset_id: int) -> None:
         self.require_token()
@@ -575,6 +733,46 @@ class GiteaReleaseClient:
             headers=self.auth_headers,
             expected=(204,),
         )
+
+
+def target_candidates(assets: TargetAssets, name: str) -> list[TargetAsset]:
+    return list(assets.get(name, ()))
+
+
+def target_by_id(assets: TargetAssets, asset_id: int) -> TargetAsset | None:
+    for candidates in assets.values():
+        for candidate in candidates:
+            if candidate.id == asset_id:
+                return candidate
+    return None
+
+
+def target_with_prefix(assets: TargetAssets, prefix: str) -> list[TargetAsset]:
+    result: list[TargetAsset] = []
+    for name, candidates in assets.items():
+        if name.startswith(prefix):
+            result.extend(candidates)
+    return sorted(result, key=lambda item: item.id)
+
+
+def refresh_after_ambiguous_write(
+    client: GiteaReleaseClient,
+    tag: str,
+    *,
+    attempts: int = 3,
+) -> TargetAssets:
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            _, assets = client.refresh_assets(tag)
+            return assets
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(min(2**attempt, 4))
+    raise MirrorError(
+        f"could not reconcile an ambiguous Gitea write: {last_error}"
+    ) from last_error
 
 
 def verify_public_target(asset: TargetAsset, spec: AssetSpec, temp_root: Path) -> None:
@@ -592,6 +790,83 @@ def verify_public_target(asset: TargetAsset, spec: AssetSpec, temp_root: Path) -
         destination.unlink(missing_ok=True)
 
 
+def verify_public_canonical(
+    client: GiteaReleaseClient,
+    tag: str,
+    spec: AssetSpec,
+    temp_root: Path,
+) -> None:
+    destination = temp_root / f"verify-canonical-{spec.name}"
+    try:
+        download_file(
+            client.canonical_download_url(tag, spec.name),
+            destination,
+            expected_size=spec.size,
+            expected_sha256=spec.sha256,
+        )
+    finally:
+        destination.unlink(missing_ok=True)
+
+
+def published_manifest_candidates(
+    assets: TargetAssets, manifest_name: str
+) -> list[TargetAsset]:
+    canonical = target_candidates(assets, manifest_name)
+    if canonical:
+        return canonical
+    # The superseded old->previous swap could crash after removing the
+    # canonical name.  That previous ID is still the published checkpoint and
+    # must participate in rollback checks before sync restores its name.
+    previous = target_with_prefix(assets, f"{manifest_name}.previous-")
+    if len(previous) > 1:
+        raise MirrorError(
+            "cannot identify the published manifest: multiple previous IDs exist"
+        )
+    return previous
+
+
+def load_published_manifest_identities(
+    assets: TargetAssets, manifest_name: str, temp_root: Path
+) -> list[ManifestIdentity]:
+    candidates = published_manifest_candidates(assets, manifest_name)
+    if len(candidates) > 8:
+        raise MirrorError("target contains too many canonical manifest attachments")
+    result: list[ManifestIdentity] = []
+    for asset in candidates:
+        if not asset.download_url.startswith("https://"):
+            raise MirrorError(
+                f"published manifest attachment {asset.id} has no public HTTPS URL"
+            )
+        if asset.size <= 0 or asset.size > MAX_PUBLISHED_MANIFEST_BYTES:
+            raise MirrorError(
+                f"published manifest attachment {asset.id} has unsafe size {asset.size}"
+            )
+        destination = temp_root / f"published-manifest-{asset.id}.json"
+        try:
+            _, digest = download_file(
+                asset.download_url,
+                destination,
+                expected_size=asset.size,
+                expected_sha256=None,
+            )
+            try:
+                raw = json.loads(destination.read_text(encoding="utf-8-sig"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise MirrorError(
+                    f"published manifest attachment {asset.id} is not valid UTF-8 JSON"
+                ) from exc
+            if not isinstance(raw, Mapping):
+                raise MirrorError(
+                    f"published manifest attachment {asset.id} root is not an object"
+                )
+            result.append(
+                manifest_identity(raw, digest, f"published manifest {asset.id}")
+            )
+        finally:
+            destination.unlink(missing_ok=True)
+    return result
+
+
 def download_source(
     source: SourceAsset, spec: AssetSpec, temp_root: Path
 ) -> Path:
@@ -605,60 +880,279 @@ def download_source(
     return destination
 
 
+def upload_with_reconciliation(
+    *,
+    client: GiteaReleaseClient,
+    release_id: int,
+    tag: str,
+    source_path: Path,
+    target_name: str,
+    spec: AssetSpec,
+    temp_root: Path,
+) -> TargetAsset:
+    try:
+        return client.upload(release_id, source_path, target_name)
+    except Exception as upload_error:
+        verified: list[TargetAsset] = []
+        for attempt in range(3):
+            try:
+                _, assets = client.refresh_assets(tag)
+            except Exception:
+                assets = {}
+            verified = []
+            for candidate in target_candidates(assets, target_name):
+                if candidate.size != spec.size:
+                    continue
+                try:
+                    verify_public_target(candidate, spec, temp_root)
+                except MirrorError:
+                    continue
+                verified.append(candidate)
+            if len(verified) == 1:
+                print(
+                    f"reconciled upload after ambiguous response: {target_name}",
+                    file=sys.stderr,
+                )
+                return verified[0]
+            if len(verified) > 1:
+                break
+            if attempt < 2:
+                time.sleep(min(2**attempt, 4))
+        raise MirrorError(
+            f"Gitea upload status for {target_name} is ambiguous after error: "
+            f"{upload_error}; found {len(verified)} verified candidates"
+        ) from upload_error
+
+
+def rename_with_reconciliation(
+    *,
+    client: GiteaReleaseClient,
+    release_id: int,
+    tag: str,
+    asset: TargetAsset,
+    name: str,
+) -> TargetAsset:
+    try:
+        return client.rename(release_id, asset.id, name)
+    except Exception as rename_error:
+        current: TargetAsset | None = None
+        for attempt in range(3):
+            try:
+                _, assets = client.refresh_assets(tag)
+            except Exception:
+                assets = {}
+            current = target_by_id(assets, asset.id)
+            if (
+                current is not None
+                and current.name == name
+                and current.size == asset.size
+            ):
+                print(
+                    f"reconciled rename after ambiguous response: {asset.id} -> {name}",
+                    file=sys.stderr,
+                )
+                return current
+            if attempt < 2:
+                time.sleep(min(2**attempt, 4))
+        state = "absent" if current is None else f"still named {current.name!r}"
+        raise MirrorError(
+            f"Gitea rename of attachment {asset.id} to {name!r} failed; "
+            f"server state is {state}: {rename_error}"
+        ) from rename_error
+
+
+def delete_with_reconciliation(
+    *,
+    client: GiteaReleaseClient,
+    release_id: int,
+    tag: str,
+    asset: TargetAsset,
+) -> None:
+    try:
+        client.delete(release_id, asset.id)
+        return
+    except Exception as delete_error:
+        for attempt in range(3):
+            try:
+                _, assets = client.refresh_assets(tag)
+            except Exception:
+                assets = {asset.name: [asset]}
+            if target_by_id(assets, asset.id) is None:
+                print(
+                    f"reconciled delete after ambiguous response: {asset.id}",
+                    file=sys.stderr,
+                )
+                return
+            if attempt < 2:
+                time.sleep(min(2**attempt, 4))
+        raise MirrorError(
+            f"Gitea deletion of attachment {asset.id} did not complete: {delete_error}"
+        ) from delete_error
+
+
+def reconcile_legacy_previous(
+    *,
+    client: GiteaReleaseClient,
+    release_id: int,
+    tag: str,
+    spec: AssetSpec,
+    assets: TargetAssets,
+) -> TargetAssets:
+    """Recover a canonical name left absent by the superseded swap protocol."""
+
+    if target_candidates(assets, spec.name):
+        return assets
+    previous = target_with_prefix(assets, f"{spec.name}.previous-")
+    if not previous:
+        return assets
+    if len(previous) != 1:
+        raise MirrorError(
+            f"cannot safely recover absent {spec.name}: multiple previous IDs exist"
+        )
+    rename_with_reconciliation(
+        client=client,
+        release_id=release_id,
+        tag=tag,
+        asset=previous[0],
+        name=spec.name,
+    )
+    _, refreshed = client.refresh_assets(tag)
+    if not target_candidates(refreshed, spec.name):
+        raise MirrorError(f"failed to restore absent canonical {spec.name}")
+    return refreshed
+
+
+def verified_pending_asset(
+    assets: TargetAssets, spec: AssetSpec, temp_root: Path
+) -> TargetAsset | None:
+    prefix = f"{spec.name}.pending-{spec.sha256[:12]}-"
+    verified: list[TargetAsset] = []
+    for candidate in target_with_prefix(assets, prefix):
+        if candidate.size != spec.size:
+            continue
+        try:
+            verify_public_target(candidate, spec, temp_root)
+        except MirrorError:
+            continue
+        verified.append(candidate)
+    return max(verified, key=lambda item: item.id) if verified else None
+
+
 def replace_mutable_attachment(
     *,
     client: GiteaReleaseClient,
     release_id: int,
     tag: str,
-    existing: TargetAsset,
-    source_path: Path,
+    existing: Sequence[TargetAsset],
+    source_path: Path | None,
     spec: AssetSpec,
     temp_root: Path,
+    staged: TargetAsset | None = None,
 ) -> None:
-    """Stage, verify, switch, verify again, and then remove the old asset."""
+    """Publish a mutable asset without ever removing the prior canonical name.
+
+    Gitea permits duplicate attachment names.  The new bytes are therefore
+    staged and anonymously verified first, renamed to the canonical name while
+    every old canonical attachment still exists, and only then are the old IDs
+    deleted.  A timeout after a successful mutation is reconciled by ID.
+    """
 
     suffix = f"{spec.sha256[:12]}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
     pending_name = validate_asset_name(f"{spec.name}.pending-{suffix}")
-    backup_name = validate_asset_name(f"{spec.name}.previous-{existing.id}-{suffix}")
-    failed_name = validate_asset_name(f"{spec.name}.failed-{suffix}")
-    pending: TargetAsset | None = None
-    renamed_old = False
-    canonical_new: TargetAsset | None = None
+    if staged is None:
+        if source_path is None:
+            raise MirrorError(f"no source file is available for {spec.name}")
+        pending = upload_with_reconciliation(
+            client=client,
+            release_id=release_id,
+            tag=tag,
+            source_path=source_path,
+            target_name=pending_name,
+            spec=spec,
+            temp_root=temp_root,
+        )
+    else:
+        pending = staged
+        pending_name = staged.name
+        print(f"reusing verified staged attachment: {pending.name}")
     try:
-        pending = client.upload(release_id, source_path, pending_name)
         verify_public_target(pending, spec, temp_root)
-        client.rename(release_id, existing.id, backup_name)
-        renamed_old = True
-        canonical_new = client.rename(release_id, pending.id, spec.name)
-        verify_public_target(canonical_new, spec, temp_root)
     except Exception:
-        if canonical_new is not None:
-            try:
-                client.rename(release_id, canonical_new.id, failed_name)
-            except Exception:
-                pass
-        elif pending is not None:
-            try:
-                client.delete(release_id, pending.id)
-            except Exception:
-                pass
-        if renamed_old:
-            try:
-                client.rename(release_id, existing.id, spec.name)
-            except Exception as rollback_error:
-                raise MirrorError(
-                    f"failed to switch {spec.name} and rollback also failed: "
-                    f"{rollback_error}"
-                )
+        try:
+            delete_with_reconciliation(
+                client=client,
+                release_id=release_id,
+                tag=tag,
+                asset=pending,
+            )
+        except Exception as cleanup_error:
+            print(
+                f"WARNING: failed staged upload {pending.id} could not be removed: "
+                f"{cleanup_error}",
+                file=sys.stderr,
+            )
         raise
+
     try:
-        client.delete(release_id, existing.id)
-    except Exception as exc:
+        canonical_new = rename_with_reconciliation(
+            client=client,
+            release_id=release_id,
+            tag=tag,
+            asset=pending,
+            name=spec.name,
+        )
+    except Exception:
+        # A timed-out PATCH remains ambiguous even after a few stale reads.
+        # Never delete this ID here: the server may have committed the rename.
+        # A rerun classifies it by ID/name/SHA and safely resumes either state.
         print(
-            f"WARNING: canonical {spec.name} is valid, but stale backup "
-            f"attachment {backup_name} could not be removed: {exc}",
+            f"WARNING: leaving attachment {pending.id} for rerun reconciliation "
+            "after an ambiguous rename",
             file=sys.stderr,
         )
+        raise
+
+    # The same UUID-backed bytes were already verified while staged.  Recheck
+    # them after the rename before retiring any previous canonical ID.
+    verify_public_target(canonical_new, spec, temp_root)
+    for previous in existing:
+        if previous.id == canonical_new.id:
+            continue
+        delete_with_reconciliation(
+            client=client,
+            release_id=release_id,
+            tag=tag,
+            asset=previous,
+        )
+
+    assets = refresh_after_ambiguous_write(client, tag)
+    for stale in (
+        target_with_prefix(assets, f"{spec.name}.previous-")
+        + target_with_prefix(
+            assets, f"{spec.name}.pending-{spec.sha256[:12]}-"
+        )
+    ):
+        delete_with_reconciliation(
+            client=client,
+            release_id=release_id,
+            tag=tag,
+            asset=stale,
+        )
+    assets = refresh_after_ambiguous_write(client, tag)
+    final = target_by_id(assets, canonical_new.id)
+    if final is None or final.name != spec.name or final.size != spec.size:
+        raise MirrorError(
+            f"post-switch gate failed for {spec.name}: new canonical ID is missing"
+        )
+    leftovers = [
+        item for item in target_candidates(assets, spec.name) if item.id != final.id
+    ]
+    if leftovers:
+        raise MirrorError(
+            f"post-switch gate failed for {spec.name}: duplicate canonical IDs remain"
+        )
+    verify_public_target(final, spec, temp_root)
+    verify_public_canonical(client, tag, spec, temp_root)
 
 
 def sync_asset(
@@ -670,61 +1164,138 @@ def sync_asset(
     client: GiteaReleaseClient,
     release_id: int,
     tag: str,
-    existing_assets: Mapping[str, TargetAsset],
+    existing_assets: TargetAssets,
     temp_root: Path,
 ) -> str:
-    existing = existing_assets.get(spec.name)
-    if existing is not None and existing.size == spec.size:
-        if mutable or verify_existing_sha:
+    if mutable:
+        existing_assets = reconcile_legacy_previous(
+            client=client,
+            release_id=release_id,
+            tag=tag,
+            spec=spec,
+            assets=existing_assets,
+        )
+    candidates = target_candidates(existing_assets, spec.name)
+    if not mutable and len(candidates) > 1:
+        raise MirrorError(f"immutable Gitea asset {spec.name} has duplicate attachments")
+
+    if mutable:
+        verified: list[TargetAsset] = []
+        for candidate in candidates:
+            if candidate.size != spec.size:
+                continue
             try:
-                verify_public_target(existing, spec, temp_root)
-                print(f"verified existing: {spec.name}")
-                return "verified-existing"
+                verify_public_target(candidate, spec, temp_root)
             except MirrorError:
-                if not mutable:
-                    raise
+                continue
+            verified.append(candidate)
+        if verified:
+            keeper = max(verified, key=lambda item: item.id)
+            extras = [item for item in candidates if item.id != keeper.id]
+            for extra in extras:
+                delete_with_reconciliation(
+                    client=client,
+                    release_id=release_id,
+                    tag=tag,
+                    asset=extra,
+                )
+            _, refreshed = client.refresh_assets(tag)
+            current = target_by_id(refreshed, keeper.id)
+            canonical = target_candidates(refreshed, spec.name)
+            if (
+                current is None
+                or current.name != spec.name
+                or len(canonical) != 1
+            ):
+                raise MirrorError(
+                    f"reconciliation lost canonical attachment {spec.name}"
+                )
+            verify_public_target(current, spec, temp_root)
+            verify_public_canonical(client, tag, spec, temp_root)
+            for stale in target_with_prefix(
+                refreshed, f"{spec.name}.previous-"
+            ) + target_with_prefix(
+                refreshed, f"{spec.name}.pending-{spec.sha256[:12]}-"
+            ):
+                delete_with_reconciliation(
+                    client=client,
+                    release_id=release_id,
+                    tag=tag,
+                    asset=stale,
+                )
+            print(f"verified existing: {spec.name}")
+            return "reconciled-existing" if extras else "verified-existing"
+
+    existing = candidates[0] if candidates else None
+    if not mutable and existing is not None and existing.size == spec.size:
+        if verify_existing_sha:
+            verify_public_target(existing, spec, temp_root)
+            print(f"verified existing: {spec.name}")
+            return "verified-existing"
         else:
             # Immutable package filenames are content/version specific.  A first
             # bootstrap should use --verify-existing-sha; later jobs may trust
             # the size of assets that a previous successful job verified.
             print(f"reused immutable asset by name/size: {spec.name}")
             return "reused-existing"
-    elif existing is not None and not mutable:
+    elif not mutable and existing is not None:
         raise MirrorError(
             f"immutable Gitea asset {spec.name} has size {existing.size}; "
             f"expected {spec.size}. Refusing destructive replacement."
         )
 
-    source_path = download_source(source, spec, temp_root)
+    staged = (
+        verified_pending_asset(existing_assets, spec, temp_root)
+        if mutable
+        else None
+    )
+    source_path = None if staged is not None else download_source(source, spec, temp_root)
     try:
-        if existing is not None:
+        if mutable:
             replace_mutable_attachment(
                 client=client,
                 release_id=release_id,
                 tag=tag,
-                existing=existing,
+                existing=candidates,
                 source_path=source_path,
                 spec=spec,
                 temp_root=temp_root,
+                staged=staged,
             )
-            print(f"replaced and verified: {spec.name}")
-            return "replaced"
+            outcome = "replaced" if candidates else "uploaded"
+            print(f"{outcome} and verified: {spec.name}")
+            return outcome
 
+        assert source_path is not None
         uploaded: TargetAsset | None = None
         try:
-            uploaded = client.upload(release_id, source_path, spec.name)
+            uploaded = upload_with_reconciliation(
+                client=client,
+                release_id=release_id,
+                tag=tag,
+                source_path=source_path,
+                target_name=spec.name,
+                spec=spec,
+                temp_root=temp_root,
+            )
             verify_public_target(uploaded, spec, temp_root)
         except Exception:
             if uploaded is not None:
                 try:
-                    client.delete(release_id, uploaded.id)
+                    delete_with_reconciliation(
+                        client=client,
+                        release_id=release_id,
+                        tag=tag,
+                        asset=uploaded,
+                    )
                 except Exception:
                     pass
             raise
         print(f"uploaded and verified: {spec.name}")
         return "uploaded"
     finally:
-        source_path.unlink(missing_ok=True)
+        if source_path is not None:
+            source_path.unlink(missing_ok=True)
 
 
 def write_json(path: Path | None, value: Mapping[str, Any]) -> None:
@@ -749,6 +1320,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--gitea-token-env", default="GITEA_TOKEN")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
+        "--allow-rollback",
+        action="store_true",
+        help=(
+            "Emergency-only override for source-tag/version rollback guards. "
+            f"Also requires {ROLLBACK_GUARD_ENV}=true; never passed by the workflow."
+        ),
+    )
+    parser.add_argument(
         "--probe-largest-full",
         action="store_true",
         help=(
@@ -761,7 +1340,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--verify-existing-sha",
         action="store_true",
-        help="Download/hash every existing immutable Gitea package (use for bootstrap audit)",
+        help=(
+            "Download/hash every existing immutable Gitea package. Bootstrap "
+            "enables this automatically."
+        ),
     )
     parser.add_argument("--max-assets", type=int, default=512)
     parser.add_argument("--max-asset-bytes", type=int, default=2_100_000_000)
@@ -775,8 +1357,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     manifest_name = validate_asset_name(args.manifest_name, "--manifest-name")
     launcher_name = validate_asset_name(args.launcher_name, "--launcher-name")
+    allow_rollback = rollback_override_enabled(args.allow_rollback, os.environ)
+    if (
+        not args.dry_run
+        and args.github_tag != DEFAULT_SOURCE_TAG
+        and not allow_rollback
+    ):
+        raise MirrorError(
+            f"write operations require the persistent source tag {DEFAULT_SOURCE_TAG!r}; "
+            "a different tag requires the guarded emergency rollback override"
+        )
     github_token = os.environ.get(args.github_token_env) or None
-    gitea_token = os.environ.get(args.gitea_token_env) or None
+    # A plan cannot write and must not even receive a credential in-process.
+    gitea_token = (
+        None if args.dry_run else (os.environ.get(args.gitea_token_env) or None)
+    )
 
     source_client = GitHubReleaseClient(args.github_repo, args.github_tag, github_token)
     source_client.load()
@@ -802,12 +1397,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise MirrorError("manifest-dev.json is not valid UTF-8 JSON") from exc
         if not isinstance(manifest, Mapping):
             raise MirrorError("manifest-dev.json root must be an object")
-        version = str(manifest.get("version") or "").strip()
-        if not version:
-            raise MirrorError("manifest.version must be a non-empty string")
-        content_hash = normalize_sha256(
-            manifest.get("contentHash"), "manifest.contentHash"
-        )
+        source_identity = manifest_identity(manifest, manifest_digest, "manifest")
+        version = source_identity.version
+        content_hash = source_identity.content_hash
 
         package_specs = collect_manifest_assets(manifest)
         for spec in package_specs.values():
@@ -864,20 +1456,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         target_assets = (
             target_client.release_assets(target_release) if target_release else {}
         )
+        published_identities = load_published_manifest_identities(
+            target_assets, manifest_name, temp_root
+        )
+        progression = validate_manifest_progression(
+            source_identity,
+            published_identities,
+            allow_rollback=allow_rollback,
+        )
+        bootstrap_sha_verification = not published_identities
+        verify_existing_sha = effective_existing_sha_verification(
+            requested=args.verify_existing_sha,
+            probe=args.probe_largest_full,
+            published_manifest_count=len(published_identities),
+        )
 
         actions: list[dict[str, Any]] = []
         for spec in specs:
-            current = target_assets.get(spec.name)
-            if current is None:
-                action = "upload"
-            elif current.size != spec.size:
-                action = "replace" if spec.kind in {"launcher", "manifest-last"} else "conflict"
-            elif (
-                spec.kind in {"launcher", "manifest-last"}
-                or args.verify_existing_sha
-                or args.probe_largest_full
-            ):
-                action = "verify-or-replace" if spec.kind in {"launcher", "manifest-last"} else "verify"
+            current = target_candidates(target_assets, spec.name)
+            mutable = spec.kind in {"launcher", "manifest-last"}
+            if not current:
+                action = "stage-verify-publish" if mutable else "upload"
+            elif mutable:
+                action = "verify-or-reconcile"
+            elif len(current) > 1 or current[0].size != spec.size:
+                action = "conflict"
+            elif verify_existing_sha:
+                action = "verify"
             else:
                 action = "reuse-by-name-size"
             actions.append(
@@ -887,6 +1492,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "size": spec.size,
                     "sha256": spec.sha256,
                     "action": action,
+                    "targetCanonicalCount": len(current),
                 }
             )
 
@@ -902,9 +1508,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "repository": args.gitea_repo,
                 "tag": args.gitea_tag,
                 "releaseExists": target_release is not None,
+                "publishedVersions": [
+                    item.version for item in published_identities
+                ],
             },
             "version": version,
             "contentHash": content_hash,
+            "manifestProgression": progression,
+            "rollbackOverride": allow_rollback,
+            "bootstrapRequiresExistingSha": bootstrap_sha_verification,
+            "effectiveVerifyExistingSha": verify_existing_sha,
             "assetCount": len(specs),
             "packageAssetCount": len(specs) if args.probe_largest_full else len(package_specs),
             "totalBytes": total_size,
@@ -951,15 +1564,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             results.append({"name": probe_spec.name, "result": probe_result})
             _, final_assets = target_client.refresh_assets(args.gitea_tag)
-            final_probe = final_assets.get(probe_spec.name)
-            if final_probe is None or final_probe.size != probe_spec.size:
+            final_probe_candidates = target_candidates(final_assets, probe_spec.name)
+            if (
+                len(final_probe_candidates) != 1
+                or final_probe_candidates[0].size != probe_spec.size
+            ):
                 raise MirrorError("large-upload probe asset is absent or has wrong size")
+            final_probe = final_probe_candidates[0]
             verify_public_target(final_probe, probe_spec, temp_root)
             receipt = {
                 "completedAtUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "operation": operation,
                 "version": version,
                 "contentHash": content_hash,
+                "manifestProgression": progression,
+                "rollbackOverride": allow_rollback,
                 "target": (
                     f"{args.gitea_url}/{args.gitea_repo}/releases/tag/"
                     f"{args.gitea_tag}"
@@ -981,12 +1600,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         # only after every package and the launcher succeeds.
         for spec in specs[:-1]:
             _, target_assets = target_client.refresh_assets(args.gitea_tag)
+            if spec.kind == "launcher":
+                latest_published = load_published_manifest_identities(
+                    target_assets, manifest_name, temp_root
+                )
+                progression = validate_manifest_progression(
+                    source_identity,
+                    latest_published,
+                    allow_rollback=allow_rollback,
+                )
             source = source_client.require(spec)
             result = sync_asset(
                 spec=spec,
                 source=source,
                 mutable=spec.kind == "launcher",
-                verify_existing_sha=args.verify_existing_sha,
+                verify_existing_sha=verify_existing_sha,
                 client=target_client,
                 release_id=release_id,
                 tag=args.gitea_tag,
@@ -997,13 +1625,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         _, target_assets = target_client.refresh_assets(args.gitea_tag)
         for spec in specs[:-1]:
-            target = target_assets.get(spec.name)
-            if target is None or target.size != spec.size:
+            target = target_candidates(target_assets, spec.name)
+            if len(target) != 1 or target[0].size != spec.size:
                 raise MirrorError(
                     f"pre-manifest gate failed: {spec.name} is absent or has wrong size"
                 )
 
         _, target_assets = target_client.refresh_assets(args.gitea_tag)
+        latest_published = load_published_manifest_identities(
+            target_assets, manifest_name, temp_root
+        )
+        progression = validate_manifest_progression(
+            source_identity,
+            latest_published,
+            allow_rollback=allow_rollback,
+        )
         manifest_result = sync_asset(
             spec=manifest_spec,
             source=manifest_source,
@@ -1018,16 +1654,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         results.append({"name": manifest_spec.name, "result": manifest_result})
 
         _, final_assets = target_client.refresh_assets(args.gitea_tag)
-        canonical_manifest = final_assets.get(manifest_name)
-        if canonical_manifest is None:
-            raise MirrorError("post-switch gate failed: canonical manifest is absent")
+        canonical_manifests = target_candidates(final_assets, manifest_name)
+        if len(canonical_manifests) != 1:
+            raise MirrorError(
+                "post-switch gate failed: canonical manifest is absent or duplicated"
+            )
+        canonical_manifest = canonical_manifests[0]
         verify_public_target(canonical_manifest, manifest_spec, temp_root)
+        verify_public_canonical(
+            target_client, args.gitea_tag, manifest_spec, temp_root
+        )
 
         receipt = {
             "completedAtUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "version": version,
             "contentHash": content_hash,
             "manifestSha256": manifest_digest,
+            "manifestProgression": progression,
+            "rollbackOverride": allow_rollback,
             "target": f"{args.gitea_url}/{args.gitea_repo}/releases/tag/{args.gitea_tag}",
             "assetCount": len(specs),
             "totalBytes": total_size,

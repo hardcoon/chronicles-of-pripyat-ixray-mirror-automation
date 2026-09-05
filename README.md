@@ -23,8 +23,30 @@ Duplicate package names must have identical size and SHA-256. Source GitHub
 metadata, manifest size/SHA, the streamed local file, Gitea attachment size,
 and an anonymous full download of every newly uploaded asset are checked.
 Package filenames are immutable: a same-name mismatch aborts instead of
-deleting data. The mutable launcher and manifest use a staged rename with
-rollback.
+deleting data. The mutable launcher and manifest use a staged, anonymous
+SHA-verified handover. Gitea permits duplicate attachment names, so a
+replacement is renamed to the canonical name while the previous canonical ID
+still exists. The previous ID is deleted only after the new ID passes another
+anonymous check. The stable
+`/releases/download/dev-channel/<canonical-name>` route is checked after the
+old ID is gone. There is no interval in which an already-published canonical
+name is absent.
+
+The first launcher/manifest upload follows the same protocol: it is uploaded
+under a unique `.pending-...` name and anonymously SHA-verified before its
+single rename makes the canonical name active. If an upload, rename, or delete
+times out after Gitea actually committed it, the script refreshes the Release
+and reconciles the result by attachment ID. A rerun also repairs a verified
+`.pending-...` upload, duplicate canonical IDs left between rename and delete,
+and the `.previous-...` state created by the superseded swap implementation.
+It never deletes the sole verified canonical attachment.
+
+Before any write, the source manifest is compared with every canonical target
+manifest. Versions must use `YYYY.MM.DD-dev.N`; the global `N`, not the date,
+is monotonic. A larger `N` advances the mirror. Equal `N` is idempotent only
+when `contentHash` also matches. A lower `N` or equal `N` with different
+content fails closed. The workflow fixes all writes to the persistent source
+tag `dev-2026.08.26.1`; it has no manual `source_tag` write input.
 
 There is deliberately no sweep that deletes old, unreferenced, or otherwise
 "stale" Release assets. This matters because an older delta can still be a
@@ -66,6 +88,8 @@ the beginning on the next run.
    launcher, a manifest, a log, or a Release asset. GitHub's automatic
    `${{ github.token }}` is sufficient for reading the public source Release;
    it cannot write to Gitea.
+   The read-only `plan` step does not receive `GITEA_TOKEN` at all, even when
+   the secret exists in the repository.
 5. Leave repository variables `GITEA_MIRROR_WRITE_ENABLED` and
    `GITEA_MIRROR_SCHEDULE_ENABLED` absent or `false` initially.
 
@@ -131,6 +155,13 @@ so two manifest switches cannot overlap. Scheduled writes require **both**
 variables. Manual `plan` remains available with neither variable. Manual
 `probe-largest-full` and `mirror` fail closed unless the write gate is true.
 
+There is deliberately no rollback control in the workflow. For a separately
+reviewed emergency recovery, direct script use requires both
+`--allow-rollback` and the exact process environment guard
+`GITEA_MIRROR_ROLLBACK_ENABLED=true`; either one alone fails closed. This
+break-glass path also covers a non-default source tag and is not part of normal
+scheduled or manual Actions operation.
+
 The documented Gitea default for one Release attachment is 2048 MB and the
 maximum files per upload is five. The script uploads one file per API request,
 so the count limit is not relevant; the one-asset probe measures the real
@@ -143,6 +174,11 @@ Every new or replaced attachment is downloaded anonymously from Gitea and
 hashed. Mutable `ChroniclesLauncher.exe` and `manifest-dev.json` are re-hashed
 on every run. Unchanged, content/version-named ZIPs are normally reused after
 exact name and size checks so an hourly no-op does not re-download 20.8 GB.
-Use `--verify-existing-sha` for bootstrap or periodic full storage audits; the
-launcher independently validates every downloaded package SHA-256 against the
-manifest before installation.
+Use `--verify-existing-sha` for periodic full storage audits; bootstrap enables
+the same check automatically. The launcher independently validates every
+downloaded package SHA-256 against the manifest before installation.
+
+Bootstrap is stricter regardless of CLI flags: until a valid canonical target
+manifest exists, every pre-existing referenced package (including a successful
+large-file probe) is downloaded anonymously and SHA-verified. Name/size reuse
+is enabled only after a completed canonical manifest establishes prior trust.
