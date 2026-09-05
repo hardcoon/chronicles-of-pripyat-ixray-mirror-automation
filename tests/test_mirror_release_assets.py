@@ -598,6 +598,36 @@ class ImmutableTrustTests(unittest.TestCase):
                 {self.spec.name: [replacement]}, [self.spec], certifications
             )
 
+    def test_new_upload_with_unavailable_uuid_route_is_not_deleted(self):
+        events = []
+        client = FakeGiteaClient(events=events)
+        source_path = self.temp_root / "source-full.zip"
+        source_path.write_bytes(b"new")
+        with patch.object(
+            mirror, "download_source", return_value=source_path
+        ), patch.object(
+            mirror,
+            "verify_public_target",
+            side_effect=mirror.AssetVerificationUnavailable("UUID route unavailable"),
+        ):
+            with self.assertRaisesRegex(MirrorError, "UUID route unavailable"):
+                sync_asset(
+                    spec=self.spec,
+                    source=self.source,
+                    mutable=False,
+                    verify_existing_sha=True,
+                    client=client,
+                    release_id=99,
+                    tag="dev-channel",
+                    existing_assets={},
+                    temp_root=self.temp_root,
+                    trusted_assets=frozenset(),
+                    certifications={},
+                    cleanup_authorized=True,
+                )
+        self.assertEqual(len(client.assets), 1)
+        self.assertFalse(any(event[0] == "delete" for event in events))
+
 
 class MutablePublicationTests(unittest.TestCase):
     def setUp(self):
@@ -616,7 +646,7 @@ class MutablePublicationTests(unittest.TestCase):
         def verify(asset, spec, temp_root):
             events.append(("verify-id", asset.id, asset.name))
             if valid_ids and asset.id not in valid_ids:
-                raise MirrorError("wrong SHA")
+                raise mirror.AssetIntegrityError("wrong SHA")
 
         def verify_canonical(client, tag, spec, temp_root):
             events.append(("verify-canonical", tag, spec.name))
@@ -722,7 +752,7 @@ class MutablePublicationTests(unittest.TestCase):
         def fail_new(asset, spec, temp_root):
             events.append(("verify-id", asset.id, asset.name))
             if asset.id != self.old.id:
-                raise MirrorError("wrong SHA")
+                raise mirror.AssetIntegrityError("wrong SHA")
 
         with patch.object(mirror, "verify_public_target", side_effect=fail_new):
             with self.assertRaisesRegex(MirrorError, "wrong SHA"):
@@ -756,7 +786,7 @@ class MutablePublicationTests(unittest.TestCase):
             nonlocal pending_checks
             events.append(("verify-id", asset.id, asset.name))
             if asset.id == self.old.id:
-                raise MirrorError("old content")
+                raise mirror.AssetIntegrityError("old content")
             pending_checks += 1
             if pending_checks == 2:
                 raise MirrorError("recovered staged network failure")
@@ -951,6 +981,69 @@ class MutablePublicationTests(unittest.TestCase):
                 cleanup_authorized=True,
             )
         self.assertFalse(any(event[0] == "delete" for event in events))
+
+    def test_unavailable_uuid_route_fails_before_any_mutation(self):
+        events = []
+        client = FakeGiteaClient([self.old], events=events)
+        with patch.object(
+            mirror,
+            "verify_public_target",
+            side_effect=mirror.AssetVerificationUnavailable("UUID route unavailable"),
+        ):
+            with self.assertRaisesRegex(MirrorError, "UUID route unavailable"):
+                sync_asset(
+                    spec=self.spec,
+                    source=SourceAsset(
+                        self.spec.name, 3, SHA_A, "https://source.invalid"
+                    ),
+                    mutable=True,
+                    verify_existing_sha=True,
+                    client=client,
+                    release_id=99,
+                    tag="dev-channel",
+                    existing_assets=client.grouped(),
+                    temp_root=self.temp_root,
+                    trusted_assets=frozenset(),
+                    certifications={},
+                    cleanup_authorized=True,
+                )
+        self.assertFalse(
+            any(event[0] in {"upload", "rename", "delete"} for event in events)
+        )
+
+    def test_short_uuid_route_response_never_triggers_duplicate_cleanup(self):
+        events = []
+        newer = target(2, self.spec.name)
+        client = FakeGiteaClient([self.old, newer], events=events)
+        with patch.object(
+            mirror,
+            "download_file",
+            side_effect=[
+                (self.spec.size, self.spec.sha256),
+                mirror.DownloadSizeMismatch("short HTTP 200 error page"),
+            ],
+        ):
+            with self.assertRaisesRegex(
+                mirror.AssetVerificationUnavailable, "cannot prove"
+            ):
+                sync_asset(
+                    spec=self.spec,
+                    source=SourceAsset(
+                        self.spec.name, 3, SHA_A, "https://source.invalid"
+                    ),
+                    mutable=True,
+                    verify_existing_sha=True,
+                    client=client,
+                    release_id=99,
+                    tag="dev-channel",
+                    existing_assets=client.grouped(),
+                    temp_root=self.temp_root,
+                    trusted_assets=frozenset(),
+                    certifications={},
+                    cleanup_authorized=True,
+                )
+        self.assertFalse(any(event[0] == "delete" for event in events))
+        self.assertEqual(set(client.assets), {self.old.id, newer.id})
 
     def test_cleanup_requires_successful_progression_guard(self):
         events = []

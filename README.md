@@ -31,7 +31,8 @@ anonymous check through its per-attachment UUID URL. Gitea's API normally
 returns a name-based `browser_download_url`, which is ambiguous during this
 handover; the script requires every API record to have a unique valid UUID and
 constructs `/attachments/<uuid>` for identity-bound verification. A missing,
-repeated, or changed UUID fails closed before deletion. The stable
+repeated, or changed UUID, or an unavailable anonymous UUID route, fails closed
+without deduplication or deletion. The stable
 `/releases/download/dev-channel/<canonical-name>` route is checked after the
 old ID is gone. There is no interval in which an already-published canonical
 name is absent.

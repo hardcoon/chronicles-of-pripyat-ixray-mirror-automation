@@ -53,6 +53,22 @@ class MirrorError(RuntimeError):
     """A safe, user-actionable mirror failure."""
 
 
+class AssetIntegrityError(MirrorError):
+    """The anonymous per-attachment download completed with wrong bytes."""
+
+
+class AssetVerificationUnavailable(MirrorError):
+    """Per-attachment identity or anonymous verification was unavailable."""
+
+
+class DownloadSizeMismatch(MirrorError):
+    """A response completed, but not at the server-declared expected size."""
+
+
+class DownloadDigestMismatch(MirrorError):
+    """A full-size response completed with an unexpected digest."""
+
+
 @dataclasses.dataclass(frozen=True)
 class AssetSpec:
     name: str
@@ -272,6 +288,14 @@ def validate_manifest_progression(
     raise MirrorError(
         f"refusing target manifest rollback/non-idempotent rewrite: {detail}"
     )
+
+
+def cleanup_authorized_for_progression(decision: str) -> bool:
+    if decision not in {"bootstrap", "advance", "idempotent", "guarded-rollback"}:
+        raise MirrorError(
+            f"cannot authorize transaction cleanup for progression {decision!r}"
+        )
+    return True
 
 
 def rollback_override_enabled(
@@ -568,13 +592,13 @@ def download_file(
 
             size = partial.stat().st_size
             if expected_size is not None and size != expected_size:
-                raise MirrorError(
+                raise DownloadSizeMismatch(
                     f"downloaded size mismatch for {destination.name}: "
                     f"expected {expected_size}, got {size}"
                 )
             digest = sha256_file(partial)
             if expected_sha256 is not None and digest != expected_sha256:
-                raise MirrorError(
+                raise DownloadDigestMismatch(
                     f"downloaded SHA-256 mismatch for {destination.name}: "
                     f"expected {expected_sha256}, got {digest}"
                 )
@@ -588,14 +612,16 @@ def download_file(
         ) as exc:
             last_error = exc
             if isinstance(exc, MirrorError) and (
-                "SHA-256 mismatch" in str(exc)
+                isinstance(exc, DownloadDigestMismatch)
                 or "Content-Range" in str(exc)
             ):
                 partial.unlink(missing_ok=True)
-                if "SHA-256 mismatch" in str(exc):
+                if isinstance(exc, DownloadDigestMismatch):
                     break
             if attempt + 1 < attempts:
                 time.sleep(min(2**attempt, 20))
+    if isinstance(last_error, (DownloadSizeMismatch, DownloadDigestMismatch)):
+        raise last_error
     raise MirrorError(f"download failed for {url}: {last_error}")
 
 
@@ -980,12 +1006,27 @@ def refresh_after_ambiguous_write(
 def verify_public_target(asset: TargetAsset, spec: AssetSpec, temp_root: Path) -> None:
     destination = temp_root / f"verify-{asset.id}-{spec.name}"
     try:
-        download_file(
-            uuid_bound_download_url(asset),
-            destination,
-            expected_size=spec.size,
-            expected_sha256=spec.sha256,
-        )
+        try:
+            download_file(
+                uuid_bound_download_url(asset),
+                destination,
+                expected_size=spec.size,
+                expected_sha256=spec.sha256,
+            )
+        except DownloadDigestMismatch as exc:
+            raise AssetIntegrityError(
+                f"Gitea attachment {asset.id} failed integrity verification: {exc}"
+            ) from exc
+        except DownloadSizeMismatch as exc:
+            # A proxy/login/error page can be a successful HTTP 200 with a
+            # shorter body.  That does not prove which attachment was served.
+            raise AssetVerificationUnavailable(
+                f"cannot prove Gitea attachment {asset.id} through its UUID route: {exc}"
+            ) from exc
+        except MirrorError as exc:
+            raise AssetVerificationUnavailable(
+                f"cannot prove Gitea attachment {asset.id} through its UUID route: {exc}"
+            ) from exc
     finally:
         destination.unlink(missing_ok=True)
 
@@ -1182,7 +1223,7 @@ def upload_with_reconciliation(
                     continue
                 try:
                     verify_public_target(candidate, spec, temp_root)
-                except MirrorError:
+                except AssetIntegrityError:
                     continue
                 verified.append(candidate)
             if len(verified) == 1:
@@ -1314,7 +1355,7 @@ def verified_pending_asset(
             continue
         try:
             verify_public_target(candidate, spec, temp_root)
-        except MirrorError:
+        except AssetIntegrityError:
             continue
         verified.append(candidate)
     if len(verified) > 1:
@@ -1368,7 +1409,7 @@ def replace_mutable_attachment(
     require_unique_target_identities([*existing, pending])
     try:
         verify_public_target(pending, spec, temp_root)
-    except Exception:
+    except AssetIntegrityError:
         # Only the exact ID returned/reconciled for this invocation is owned by
         # this transaction.  A staged ID discovered on a rerun is left intact
         # when its re-verification fails; prefix-shaped names are not ownership.
@@ -1485,7 +1526,7 @@ def sync_asset(
                 continue
             try:
                 verify_public_target(candidate, spec, temp_root)
-            except MirrorError:
+            except AssetIntegrityError:
                 continue
             verified.append(candidate)
         if verified:
@@ -1579,7 +1620,7 @@ def sync_asset(
             )
             verify_public_target(uploaded, spec, temp_root)
             certify_target(certifications, uploaded, spec)
-        except Exception:
+        except AssetIntegrityError:
             if uploaded is not None:
                 try:
                     delete_with_reconciliation(
@@ -1867,7 +1908,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 temp_root=temp_root,
                 trusted_assets=published_state.trusted_assets,
                 certifications=certifications,
-                cleanup_authorized=True,
+                cleanup_authorized=cleanup_authorized_for_progression(progression),
             )
             results.append({"name": probe_spec.name, "result": probe_result})
             _, final_assets = target_client.refresh_assets(args.gitea_tag)
@@ -1933,7 +1974,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 temp_root=temp_root,
                 trusted_assets=latest_state.trusted_assets,
                 certifications=certifications,
-                cleanup_authorized=True,
+                cleanup_authorized=cleanup_authorized_for_progression(progression),
             )
             results.append({"name": spec.name, "result": result})
 
@@ -1967,7 +2008,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             temp_root=temp_root,
             trusted_assets=latest_state.trusted_assets,
             certifications=certifications,
-            cleanup_authorized=True,
+            cleanup_authorized=cleanup_authorized_for_progression(progression),
         )
         results.append({"name": manifest_spec.name, "result": manifest_result})
 
