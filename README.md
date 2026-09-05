@@ -194,6 +194,13 @@ the logical ZIP, the plan reports the derived-manifest SHA as `null` with
 `sha256Status: pending-part-hashes`; it never presents a placeholder-based
 digest as final.
 
+On an idempotent run with a complete published transport map, the script
+reconstructs the deterministic derived-manifest bytes during planning. If the
+single canonical target manifest already has that exact size and SHA-256, the
+plan reports `manifestWillChange: false` and
+`verify-existing-derived-manifest`; the write pass verifies and reuses both
+mutable assets without upload, rename, or delete operations.
+
 Gitea's built-in continuous Git mirror is not used. gitea.com currently
 advertises repository mirrors as disabled, and Git mirroring would not copy
 GitHub Release attachments in any case.

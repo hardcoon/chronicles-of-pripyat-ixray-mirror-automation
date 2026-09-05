@@ -1421,6 +1421,23 @@ def published_manifest_candidates(
     return sorted(by_id.values(), key=lambda item: item.id)
 
 
+def canonical_manifest_matches(
+    spec: AssetSpec,
+    assets: TargetAssets,
+    published_state: PublishedState,
+) -> bool:
+    """Return true only for one exact, already parsed canonical manifest."""
+
+    candidates = target_candidates(assets, spec.name)
+    if len(candidates) != 1 or candidates[0].size != spec.size:
+        return False
+    canonical = candidates[0]
+    return any(
+        item.asset == canonical and item.identity.sha256 == spec.sha256
+        for item in published_state.manifests
+    )
+
+
 def load_published_state(
     client: GiteaReleaseClient,
     assets: TargetAssets,
@@ -2694,6 +2711,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
 
         actions: list[dict[str, Any]] = []
+        manifest_will_change = False
         segmented_part_names = {
             part.spec.name
             for item in provisional_segmented
@@ -2721,11 +2739,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             if spec.kind == "derived-manifest-last":
-                action = (
-                    "stage-derived-manifest-last"
-                    if digest_known
-                    else "stage-derived-manifest-last-after-parts-hashed"
+                manifest_is_current = digest_known and canonical_manifest_matches(
+                    spec,
+                    target_assets,
+                    published_state,
                 )
+                manifest_will_change = not manifest_is_current
+                if manifest_is_current:
+                    action = "verify-existing-derived-manifest"
+                else:
+                    action = (
+                        "stage-derived-manifest-last"
+                        if digest_known
+                        else "stage-derived-manifest-last-after-parts-hashed"
+                    )
             elif not digest_known:
                 if len(current) > 1 or (
                     current and current[0].size != spec.size
@@ -2844,7 +2871,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "assetCount": len(plan_specs),
             "packageAssetCount": len(plan_package_specs),
             "totalBytes": total_size,
-            "manifestWillChange": not args.probe_largest_full,
+            "manifestWillChange": manifest_will_change,
             "manifestIsLast": not args.probe_largest_full,
             "bootstrapCleanup": bootstrap_cleanup,
             "postManifestPrune": planned_prune,

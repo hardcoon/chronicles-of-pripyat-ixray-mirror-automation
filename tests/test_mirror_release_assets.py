@@ -898,14 +898,36 @@ class SegmentedTransportTests(unittest.TestCase):
             "https://source.invalid/logical": self.logical_bytes,
         }
 
+        target_client = FullFakeGitea()
+
         def fake_download(url, destination, **kwargs):
-            payload = source_payloads[url]
+            payload = source_payloads.get(url)
+            if payload is None:
+                target_asset = next(
+                    (
+                        asset
+                        for asset in target_client.assets.values()
+                        if asset.download_url == url
+                    ),
+                    None,
+                )
+                if target_asset is None:
+                    raise AssertionError(f"unexpected download URL: {url}")
+                payload = target_client.uploaded_payloads[target_asset.id]
             destination.write_bytes(payload)
             return len(payload), hashlib.sha256(payload).hexdigest()
 
-        target_client = FullFakeGitea()
         with tempfile.TemporaryDirectory() as plan_name:
             plan_path = Path(plan_name) / "plan.json"
+            repeat_plan_path = Path(plan_name) / "repeat-plan.json"
+            source_binding = [
+                "--expected-source-manifest-sha256",
+                manifest_digest,
+                "--expected-source-launcher-size",
+                str(len(launcher_bytes)),
+                "--expected-source-launcher-sha256",
+                launcher_digest,
+            ]
             with patch.object(
                 mirror, "GitHubReleaseClient", FakeSourceClient
             ), patch.object(
@@ -924,17 +946,37 @@ class SegmentedTransportTests(unittest.TestCase):
                         [
                             "--plan-out",
                             str(plan_path),
-                            "--expected-source-manifest-sha256",
-                            manifest_digest,
-                            "--expected-source-launcher-size",
-                            str(len(launcher_bytes)),
-                            "--expected-source-launcher-sha256",
-                            launcher_digest,
+                            *source_binding,
                         ]
                     ),
                     0,
                 )
-            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                mutation_count = len(
+                    [
+                        event
+                        for event in target_client.events
+                        if event[0] in {"upload", "rename", "delete"}
+                    ]
+                )
+                self.assertEqual(
+                    mirror.main(
+                        [
+                            "--plan-out",
+                            str(repeat_plan_path),
+                            *source_binding,
+                        ]
+                    ),
+                    0,
+                )
+                repeat_plan = json.loads(
+                    repeat_plan_path.read_text(encoding="utf-8")
+                )
+                repeated_mutations = [
+                    event
+                    for event in target_client.events
+                    if event[0] in {"upload", "rename", "delete"}
+                ][mutation_count:]
 
         self.assertTrue(plan["sourceBindingChecked"])
         manifest_action = next(
@@ -948,6 +990,17 @@ class SegmentedTransportTests(unittest.TestCase):
             manifest_action["action"],
             "stage-derived-manifest-last-after-parts-hashed",
         )
+        self.assertFalse(repeat_plan["manifestWillChange"])
+        repeat_manifest_action = next(
+            action
+            for action in repeat_plan["actions"]
+            if action["kind"] == "derived-manifest-last"
+        )
+        self.assertEqual(
+            repeat_manifest_action["action"],
+            "verify-existing-derived-manifest",
+        )
+        self.assertEqual(repeated_mutations, [])
 
         rename_events = [event for event in target_client.events if event[0] == "rename"]
         self.assertEqual(rename_events[-1][2], "manifest-dev.json")
