@@ -29,13 +29,17 @@ concurrency:
 
 jobs:
   plan:
-    # Deliberately credential-free with respect to Gitea. It runs before each
-    # write so the exact checked-out SHA gets a dry-run gate.
-    if: github.event_name == 'workflow_dispatch' || vars.GITEA_MIRROR_SCHEDULE_ENABLED == 'true'
+    # A dispatch from another ref is intentionally inert. The exact main SHA is
+    # checked out without credentials, and this job never receives GITEA_TOKEN.
+    if: >-
+      github.event.repository.default_branch == 'main' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       vars.GITEA_MIRROR_SCHEDULE_ENABLED == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Check out the dispatched automation SHA
+      - name: Check out trusted mirror automation
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
@@ -52,12 +56,16 @@ jobs:
       - name: Plan manifest-selected assets
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
           INPUT_OPERATION: ${{ inputs.operation }}
           INPUT_VERIFY_EXISTING_SHA: ${{ inputs.verify_existing_sha }}
         shell: bash
         run: |
           set -euo pipefail
           operation="${INPUT_OPERATION:-mirror}"
+          if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
+            operation="mirror"
+          fi
           args=(
             --github-repo hardcoon/chronicles-of-pripyat-ixray
             --github-tag dev-2026.08.26.1
@@ -67,46 +75,45 @@ jobs:
             --dry-run
             --plan-out "$RUNNER_TEMP/gitea-mirror-plan.json"
           )
-          if [[ "$operation" == "probe-largest-full" ]]; then
-            args+=(--probe-largest-full)
-          fi
+          case "$operation" in
+            plan|mirror) ;;
+            probe-largest-full) args+=(--probe-largest-full) ;;
+            *) echo "Unsupported operation: $operation" >&2; exit 2 ;;
+          esac
           if [[ "$INPUT_VERIFY_EXISTING_SHA" == "true" ]]; then
             args+=(--verify-existing-sha)
           fi
           python mirror_release_assets.py "${args[@]}"
 
-      - name: Save plan
+      - name: Save reviewed plan
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: gitea-mirror-plan-${{ github.run_id }}
+          name: gitea-mirror-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/gitea-mirror-plan.json
           if-no-files-found: warn
           retention-days: 30
 
   write:
     needs: plan
+    # Gitea writes are possible only for the exact main workflow revision and
+    # only through the protected gitea-production Environment secret.
     if: >-
+      needs.plan.result == 'success' &&
       github.event.repository.default_branch == 'main' &&
       github.ref == 'refs/heads/main' &&
-      (
-        (
-          github.event_name == 'workflow_dispatch' &&
-          inputs.operation != 'plan' &&
-          vars.GITEA_MIRROR_WRITE_ENABLED == 'true'
-        ) ||
-        (
-          github.event_name == 'schedule' &&
-          vars.GITEA_MIRROR_WRITE_ENABLED == 'true' &&
-          vars.GITEA_MIRROR_SCHEDULE_ENABLED == 'true'
-        )
-      )
+      ((github.event_name == 'workflow_dispatch' &&
+        inputs.operation != 'plan' &&
+        vars.GITEA_MIRROR_WRITE_ENABLED == 'true') ||
+       (github.event_name == 'schedule' &&
+        vars.GITEA_MIRROR_WRITE_ENABLED == 'true' &&
+        vars.GITEA_MIRROR_SCHEDULE_ENABLED == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 360
     environment:
       name: gitea-production
     steps:
-      - name: Check out the guarded main SHA
+      - name: Check out the planned main revision
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
@@ -124,21 +131,12 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_OPERATION: ${{ inputs.operation }}
           INPUT_VERIFY_EXISTING_SHA: ${{ inputs.verify_existing_sha }}
-          WRITE_ENABLED: ${{ vars.GITEA_MIRROR_WRITE_ENABLED }}
-          SCHEDULE_ENABLED: ${{ vars.GITEA_MIRROR_SCHEDULE_ENABLED }}
         shell: bash
         run: |
           set -euo pipefail
           operation="${INPUT_OPERATION:-mirror}"
           if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
-            if [[ "$SCHEDULE_ENABLED" != "true" || "$WRITE_ENABLED" != "true" ]]; then
-              echo "Scheduled mirroring is gated off" >&2
-              exit 2
-            fi
             operation="mirror"
-          elif [[ "$WRITE_ENABLED" != "true" ]]; then
-            echo "Set GITEA_MIRROR_WRITE_ENABLED=true only after reviewing a plan" >&2
-            exit 2
           fi
           args=(
             --github-repo hardcoon/chronicles-of-pripyat-ixray
@@ -159,11 +157,11 @@ jobs:
           fi
           python mirror_release_assets.py "${args[@]}"
 
-      - name: Save write plan and receipt
+      - name: Save write receipt
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: gitea-mirror-write-${{ github.run_id }}
+          name: gitea-mirror-write-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/gitea-mirror-write-plan.json
             ${{ runner.temp }}/gitea-mirror-receipt.json

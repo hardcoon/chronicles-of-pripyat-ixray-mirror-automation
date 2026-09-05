@@ -1253,10 +1253,17 @@ class WorkflowSafetyTests(unittest.TestCase):
             / "workflows"
             / "mirror-release-to-gitea.yml"
         ).read_text(encoding="utf-8")
-        plan = workflow.split("- name: Plan manifest-selected assets", 1)[1].split(
-            "- name: Mirror manifest-selected assets", 1
-        )[0]
-        self.assertNotIn("GITEA_TOKEN", plan)
+        plan_job, write_job = workflow.split("\n  write:\n", 1)
+        self.assertNotIn("${{ secrets.GITEA_TOKEN }}", plan_job)
+        self.assertNotIn("environment:", plan_job)
+        self.assertIn("${{ secrets.GITEA_TOKEN }}", write_job)
+        self.assertEqual(workflow.count("${{ secrets.GITEA_TOKEN }}"), 1)
+        self.assertIn("needs: plan", write_job)
+        self.assertIn("github.ref == 'refs/heads/main'", plan_job)
+        self.assertIn("github.ref == 'refs/heads/main'", write_job)
+        self.assertIn("name: gitea-production", write_job)
+        self.assertGreaterEqual(workflow.count("ref: ${{ github.sha }}"), 2)
+        self.assertGreaterEqual(workflow.count("persist-credentials: false"), 2)
         self.assertNotIn("source_tag:", workflow)
         self.assertIn("--github-tag dev-2026.08.26.1", workflow)
         for action in ("actions/checkout", "actions/setup-python", "actions/upload-artifact"):

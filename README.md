@@ -96,13 +96,17 @@ the beginning on the next run.
    A PAT scope is an API-unit scope, not a restriction to one repository, so a
    dedicated mirror service account with collaborator access only to the
    download repository is the safest long-term owner if that is practical.
-4. Save the token only as the GitHub Actions repository secret
-   `GITEA_TOKEN`. Never put it on disk, in Git, a workflow argument, the
-   launcher, a manifest, a log, or a Release asset. GitHub's automatic
-   `${{ github.token }}` is sufficient for reading the public source Release;
-   it cannot write to Gitea.
-   The read-only `plan` step does not receive `GITEA_TOKEN` at all, even when
-   the secret exists in the repository.
+4. Create the protected GitHub Environment `gitea-production`, allow deployment
+   only from the `main` branch, and save the token only as that Environment's
+   `GITEA_TOKEN` secret. Do not create a repository-level secret with this name;
+   revoke any token that was previously stored there. Never put the token on
+   disk, in Git, a workflow argument, the launcher, a manifest, a log, or a
+   Release asset. GitHub's automatic `${{ github.token }}` is sufficient for
+   reading the public source Release; it cannot write to Gitea.
+   The read-only `plan` job has no Environment and never receives
+   `GITEA_TOKEN`. The separate `write` job runs only for `refs/heads/main`,
+   checks out that exact planned commit without persisted credentials, and is
+   the only job admitted to `gitea-production`.
 5. Leave repository variables `GITEA_MIRROR_WRITE_ENABLED` and
    `GITEA_MIRROR_SCHEDULE_ENABLED` absent or `false` initially.
 
