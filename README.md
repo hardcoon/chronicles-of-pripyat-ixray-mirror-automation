@@ -79,6 +79,12 @@ neither downloads nor uploads the game:
 GitHub Release -> GitHub-hosted runner temporary disk -> Gitea Release
 ```
 
+Release attachments are sent through Gitea's documented raw
+`application/octet-stream` request form with the attachment name in the query
+string. This avoids the extra multipart parser/spool path for multi-gigabyte
+files while preserving an exact `Content-Length` and the same post-upload
+size/SHA-256 verification.
+
 The first bootstrap still has to transfer the current approximately 20.8 GB
 once between the services. Later runs reuse unchanged package attachments and
 transfer only new or replaced assets. Gitea's API does not provide resumable

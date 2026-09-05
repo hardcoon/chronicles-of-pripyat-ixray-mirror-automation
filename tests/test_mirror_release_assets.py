@@ -153,6 +153,78 @@ class FakeGiteaClient:
         return f"https://example.invalid/releases/download/{tag}/{name}"
 
 
+class FakeUploadConnection:
+    def __init__(self, response):
+        self.response = response
+        self.request = None
+        self.headers = {}
+        self.body = bytearray()
+        self.closed = False
+
+    def putrequest(self, method, target):
+        self.request = (method, target)
+
+    def putheader(self, name, value):
+        self.headers[name.lower()] = value
+
+    def endheaders(self):
+        return None
+
+    def send(self, data):
+        self.body.extend(data)
+
+    def getresponse(self):
+        return self.response
+
+    def close(self):
+        self.closed = True
+
+
+class GiteaRawUploadTests(unittest.TestCase):
+    def test_upload_streams_exact_raw_octet_body(self):
+        payload = b"release-package-bytes"
+        response_record = {
+            "id": 42,
+            "uuid": "00000000-0000-0000-0000-000000000042",
+            "name": "package name.zip",
+            "size": len(payload),
+            "browser_download_url": (
+                "https://example.invalid/releases/download/dev-channel/"
+                "package%20name.zip"
+            ),
+        }
+        response = FakeResponse(json.dumps(response_record).encode("utf-8"), 201)
+        connection = FakeUploadConnection(response)
+        client = GiteaReleaseClient(
+            "https://example.invalid", "owner/repo", token="secret-token"
+        )
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            source = Path(temp_name) / "local-source.zip"
+            source.write_bytes(payload)
+            with patch.object(
+                mirror.http.client,
+                "HTTPSConnection",
+                return_value=connection,
+            ):
+                uploaded = client.upload(99, source, "package name.zip")
+
+        self.assertEqual(uploaded.id, 42)
+        self.assertEqual(
+            connection.request,
+            (
+                "POST",
+                "/api/v1/repos/owner/repo/releases/99/assets?"
+                "name=package+name.zip",
+            ),
+        )
+        self.assertEqual(connection.headers["content-type"], "application/octet-stream")
+        self.assertEqual(connection.headers["content-length"], str(len(payload)))
+        self.assertNotIn("multipart", connection.headers["content-type"])
+        self.assertEqual(bytes(connection.body), payload)
+        self.assertTrue(connection.closed)
+
+
 class ManifestAssetsTests(unittest.TestCase):
     def test_collects_current_and_chain_packages(self):
         manifest = {

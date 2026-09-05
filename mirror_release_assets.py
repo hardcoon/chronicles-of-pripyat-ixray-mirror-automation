@@ -836,14 +836,6 @@ class GiteaReleaseClient:
     def upload(self, release_id: int, path: Path, target_name: str) -> TargetAsset:
         token = self.require_token()
         target_name = validate_asset_name(target_name, "target attachment name")
-        boundary = "------------------------" + uuid.uuid4().hex
-        preamble = (
-            f"--{boundary}\r\n"
-            "Content-Disposition: form-data; name=\"attachment\"; "
-            f"filename=\"{path.name}\"\r\n"
-            "Content-Type: application/octet-stream\r\n\r\n"
-        ).encode("ascii")
-        epilogue = f"\r\n--{boundary}--\r\n".encode("ascii")
         size = path.stat().st_size
         endpoint = (
             f"{self.api_root}/releases/{release_id}/assets?"
@@ -861,14 +853,17 @@ class GiteaReleaseClient:
             connection.putheader("User-Agent", USER_AGENT)
             connection.putheader("Accept", "application/json")
             connection.putheader("Authorization", f"token {token}")
-            connection.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
-            connection.putheader("Content-Length", str(len(preamble) + size + len(epilogue)))
+            # Gitea explicitly supports a raw application/octet-stream body
+            # when the attachment name is supplied in the query string.  Use
+            # that path instead of multipart/form-data so reverse proxies and
+            # Gitea do not have to parse/spool another multi-gigabyte form
+            # upload before committing the release attachment.
+            connection.putheader("Content-Type", "application/octet-stream")
+            connection.putheader("Content-Length", str(size))
             connection.endheaders()
-            connection.send(preamble)
             with path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
                     connection.send(chunk)
-            connection.send(epilogue)
             response = connection.getresponse()
             payload = response.read()
         finally:
