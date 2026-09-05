@@ -390,7 +390,7 @@ class ManifestAssetsTests(unittest.TestCase):
         with self.assertRaisesRegex(MirrorError, "duplicate Gitea attachment UUID"):
             client._group_asset_records([first, second])
 
-    def test_gitea_asset_listing_uses_all_paginated_records(self):
+    def test_gitea_asset_listing_uses_complete_dedicated_endpoint(self):
         client = GiteaReleaseClient(
             "https://example.invalid", "owner/repo", token=None
         )
@@ -407,47 +407,37 @@ class ManifestAssetsTests(unittest.TestCase):
                 ),
             }
 
-        pages = [
-            (200, [record(index) for index in range(1, 51)]),
-            (200, [record(index) for index in range(51, 101)]),
-            (200, [record(index) for index in range(101, 104)]),
-            (200, []),
-        ]
-        with patch.object(mirror, "request_json", side_effect=pages) as request:
+        response = (200, [record(index) for index in range(1, 104)])
+        with patch.object(mirror, "request_json", return_value=response) as request:
             assets = client.release_assets({"id": 99, "assets": []})
         self.assertEqual(sum(map(len, assets.values())), 103)
-        self.assertEqual(request.call_count, 4)
-        self.assertIn("page=4&limit=50", request.call_args.args[0])
+        request.assert_called_once_with(
+            "https://example.invalid/api/v1/repos/owner/repo/releases/99/assets",
+            headers={},
+        )
 
-    def test_gitea_asset_listing_does_not_treat_server_capped_page_as_eof(self):
+    def test_gitea_asset_listing_does_not_poll_ignored_page_parameters(self):
         client = GiteaReleaseClient(
             "https://example.invalid", "owner/repo", token=None
         )
-
-        def record(asset_id):
-            return {
-                "id": asset_id,
-                "uuid": f"00000000-0000-0000-0000-{asset_id:012x}",
-                "name": f"part-{asset_id:03d}.bin",
-                "size": 3,
-                "browser_download_url": (
-                    "https://example.invalid/releases/download/dev-channel/"
-                    f"part-{asset_id:03d}.bin"
-                ),
-            }
-
-        # The client requests 50, but this simulated server caps every page at 2.
-        pages = [
-            (200, [record(1), record(2)]),
-            (200, [record(3), record(4)]),
-            (200, [record(5)]),
-            (200, []),
-        ]
-        with patch.object(mirror, "request_json", side_effect=pages) as request:
+        repeated_asset = {
+            "id": 98737,
+            "uuid": "00000000-0000-0000-0000-000000098737",
+            "name": "partial.zip",
+            "size": 3,
+            "browser_download_url": (
+                "https://example.invalid/releases/download/dev-channel/partial.zip"
+            ),
+        }
+        with patch.object(
+            mirror,
+            "request_json",
+            return_value=(200, [repeated_asset]),
+        ) as request:
             assets = client.release_assets({"id": 99, "assets": []})
-        self.assertEqual(sum(map(len, assets.values())), 5)
-        self.assertEqual(request.call_count, 4)
-        self.assertIn("page=4&limit=50", request.call_args.args[0])
+        self.assertEqual([asset.id for asset in assets["partial.zip"]], [98737])
+        self.assertEqual(request.call_count, 1)
+        self.assertNotIn("?", request.call_args.args[0])
 
 
 class SegmentedTransportTests(unittest.TestCase):

@@ -1160,11 +1160,14 @@ class GiteaReleaseClient:
         return result
 
     def release_assets(self, release: Mapping[str, Any]) -> TargetAssets:
-        """Enumerate every attachment through Gitea's paginated endpoint.
+        """Enumerate attachments through Gitea's dedicated list endpoint.
 
         The release object embeds an ``assets`` array, but hosted instances may
         truncate that array.  A segmented mirror has more than one hundred
         attachments, so publication gates must use the dedicated list API.
+        Gitea's documented endpoint is intentionally unpaginated: it accepts
+        no page/limit parameters.  Hosted Gitea ignores such query parameters,
+        so polling pages would repeat the same non-empty list forever.
         """
 
         try:
@@ -1173,22 +1176,13 @@ class GiteaReleaseClient:
             raise MirrorError("Gitea release ID is invalid") from exc
         if release_id <= 0:
             raise MirrorError("Gitea release ID must be positive")
-        records: list[Any] = []
-        page_size = 50
-        for page in range(1, 102):
-            _, payload = request_json(
-                f"{self.api_root}/releases/{release_id}/assets?"
-                + urllib.parse.urlencode({"page": page, "limit": page_size}),
-                headers=self.auth_headers,
-            )
-            if not isinstance(payload, list):
-                raise MirrorError("Gitea release assets response is not an array")
-            if not payload:
-                break
-            records.extend(payload)
-        else:
-            raise MirrorError("Gitea release asset pagination exceeded 5050 entries")
-        return self._group_asset_records(records)
+        _, payload = request_json(
+            f"{self.api_root}/releases/{release_id}/assets",
+            headers=self.auth_headers,
+        )
+        if not isinstance(payload, list):
+            raise MirrorError("Gitea release assets response is not an array")
+        return self._group_asset_records(payload)
 
     def refresh_assets(self, tag: str) -> tuple[Mapping[str, Any], TargetAssets]:
         release = self.get_release(tag)

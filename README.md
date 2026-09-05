@@ -144,9 +144,11 @@ unchanged parts, allowing later runs to reuse them without re-splitting the
 logical package. Explicit verification re-downloads/hashes the public parts,
 not the source ZIP.
 
-The attachment inventory always follows the dedicated paginated Gitea API
-until it receives an empty page. It does not assume that a short page is the
-end, because a hosted server may cap pages below the requested limit.
+The attachment inventory uses Gitea's dedicated release-attachment list API,
+not the potentially truncated array embedded in a Release response. That
+endpoint is unpaginated in Gitea's API contract. In particular, the script
+does not append unsupported `page`/`limit` parameters: gitea.com ignores them
+and would return the same non-empty attachment list for every requested page.
 
 ## Authentication and one-time setup
 
