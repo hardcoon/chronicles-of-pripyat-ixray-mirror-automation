@@ -442,12 +442,17 @@ def planned_action(
     mutable: bool,
     verify_existing_sha: bool,
     trusted_assets: frozenset[tuple[str, int, str]],
+    recover_incomplete_immutable: bool = False,
 ) -> str:
     if not current:
         return "stage-verify-publish" if mutable else "upload"
     if mutable:
         return "verify-or-reconcile"
-    if len(current) > 1 or current[0].size != spec.size:
+    if len(current) > 1:
+        return "conflict"
+    if current[0].size != spec.size:
+        if recover_incomplete_immutable and 0 < current[0].size < spec.size:
+            return "delete-incomplete-and-upload"
         return "conflict"
     if verify_existing_sha:
         return "verify"
@@ -1508,6 +1513,7 @@ def sync_asset(
     trusted_assets: frozenset[tuple[str, int, str]],
     certifications: MutableMapping[str, TargetCertification],
     cleanup_authorized: bool,
+    recover_incomplete_immutable: bool = False,
 ) -> str:
     require_unique_target_identities(all_target_assets(existing_assets))
     if mutable:
@@ -1566,6 +1572,33 @@ def sync_asset(
             return "reconciled-existing" if extras else "verified-existing"
 
     existing = candidates[0] if candidates else None
+    if not mutable and existing is not None and existing.size != spec.size:
+        if not (
+            recover_incomplete_immutable
+            and cleanup_authorized
+            and 0 < existing.size < spec.size
+        ):
+            raise MirrorError(
+                f"immutable Gitea asset {spec.name} has size {existing.size}; "
+                f"expected {spec.size}. Refusing destructive replacement."
+            )
+        print(
+            f"deleting incomplete bootstrap probe: {spec.name} "
+            f"({existing.size}/{spec.size} bytes)"
+        )
+        delete_with_reconciliation(
+            client=client,
+            release_id=release_id,
+            tag=tag,
+            asset=existing,
+        )
+        _, existing_assets = client.refresh_assets(tag)
+        candidates = target_candidates(existing_assets, spec.name)
+        if candidates:
+            raise MirrorError(
+                f"incomplete bootstrap probe {spec.name} remained after deletion"
+            )
+        existing = None
     if not mutable and existing is not None and existing.size == spec.size:
         inherited_trust = asset_trust_key(spec) in trusted_assets
         if verify_existing_sha or not inherited_trust:
@@ -1579,12 +1612,6 @@ def sync_asset(
             certify_target(certifications, existing, spec)
             print(f"reused certified immutable asset: {spec.name}")
             return "certified-existing"
-    elif not mutable and existing is not None:
-        raise MirrorError(
-            f"immutable Gitea asset {spec.name} has size {existing.size}; "
-            f"expected {spec.size}. Refusing destructive replacement."
-        )
-
     staged = (
         verified_pending_asset(existing_assets, spec, temp_root)
         if mutable
@@ -1822,6 +1849,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
         actions: list[dict[str, Any]] = []
+        recover_incomplete_probe = (
+            args.probe_largest_full and not published_state.manifests
+        )
         for spec in specs:
             current = target_candidates(target_assets, spec.name)
             mutable = spec.kind in {"launcher", "manifest-last"}
@@ -1831,6 +1861,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 mutable=mutable,
                 verify_existing_sha=verify_existing_sha,
                 trusted_assets=published_state.trusted_assets,
+                recover_incomplete_immutable=recover_incomplete_probe,
             )
             actions.append(
                 {
@@ -1912,6 +1943,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 trusted_assets=published_state.trusted_assets,
                 certifications=certifications,
                 cleanup_authorized=cleanup_authorized_for_progression(progression),
+                recover_incomplete_immutable=recover_incomplete_probe,
             )
             results.append({"name": probe_spec.name, "result": probe_result})
             _, final_assets = target_client.refresh_assets(args.gitea_tag)

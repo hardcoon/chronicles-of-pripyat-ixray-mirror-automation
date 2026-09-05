@@ -656,6 +656,59 @@ class ImmutableTrustTests(unittest.TestCase):
             "reuse-certified",
         )
 
+    def test_probe_plan_recovers_only_smaller_unpublished_asset(self):
+        incomplete = target(8, self.spec.name, self.spec.size - 1)
+        self.assertEqual(
+            planned_action(
+                self.spec,
+                [incomplete],
+                mutable=False,
+                verify_existing_sha=True,
+                trusted_assets=frozenset(),
+                recover_incomplete_immutable=True,
+            ),
+            "delete-incomplete-and-upload",
+        )
+        self.assertEqual(
+            planned_action(
+                self.spec,
+                [incomplete],
+                mutable=False,
+                verify_existing_sha=True,
+                trusted_assets=frozenset(),
+            ),
+            "conflict",
+        )
+
+    def test_probe_deletes_smaller_unpublished_asset_before_upload(self):
+        incomplete = target(8, self.spec.name, self.spec.size - 1)
+        events = []
+        client = FakeGiteaClient([incomplete], events=events)
+        source_path = self.temp_root / "source-full.zip"
+        source_path.write_bytes(b"new")
+        certifications = {}
+        with patch.object(
+            mirror, "download_source", return_value=source_path
+        ), patch.object(mirror, "verify_public_target"):
+            result = sync_asset(
+                spec=self.spec,
+                source=self.source,
+                mutable=False,
+                verify_existing_sha=True,
+                client=client,
+                release_id=99,
+                tag="dev-channel",
+                existing_assets=client.grouped(),
+                temp_root=self.temp_root,
+                trusted_assets=frozenset(),
+                certifications=certifications,
+                cleanup_authorized=True,
+                recover_incomplete_immutable=True,
+            )
+        self.assertEqual(result, "uploaded")
+        self.assertEqual(events[0], ("delete", incomplete.id))
+        self.assertEqual(events[2][0], "upload")
+
     def test_different_published_sha_does_not_trust_same_name_and_size(self):
         prior = AssetSpec(self.spec.name, self.spec.size, SHA_B, "published")
         with self.assertRaisesRegex(MirrorError, "wrong SHA"):
