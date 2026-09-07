@@ -103,11 +103,13 @@ delta still present anywhere in the new manifest remains referenced and is
 therefore retained. Only after the new canonical manifest has passed anonymous
 UUID and name-route verification may the script prune an immutable attachment
 whose exact ID/name/size/SHA came from a fully parsed previous target manifest
-and whose name is absent from the new physical transport. Unreferenced orphan
-parts are not deleted. Transaction cleanup remains limited to exact IDs owned
-by the current mutable upload. Package names underneath launcher/manifest
-mutable namespaces are rejected so package data cannot be mistaken for
-transaction state.
+and whose name is absent from the new physical transport. Arbitrary
+unreferenced orphan parts are not deleted. Exact short
+`.pending-<sha-prefix>-<timestamp>-<nonce>` transactions created for the same
+desired asset may be retired after the manifest-progression guard succeeds;
+all other cleanup remains limited to exact transaction-owned IDs. Package
+names underneath launcher/manifest mutable namespaces are rejected so package
+data cannot be mistaken for transaction state.
 
 One separately narrow bootstrap repair handles interrupted legacy/direct
 uploads: before any target manifest exists, exactly one attachment under a
@@ -130,10 +132,12 @@ GitHub Release -> GitHub-hosted runner temporary disk -> Gitea Release
 
 Release attachments are sent through Gitea's documented raw
 `application/octet-stream` request form with the attachment name in the query
-string. The request uses HTTP/1.1 chunked transfer framing and avoids both the
-multipart parser/spool path and known-length request buffering. The decoded
-body is an exact contiguous source-ZIP byte range and receives a full anonymous
-size/SHA-256 verification through its attachment UUID.
+string. Application segmentation bounds every request to 256 MiB, so the
+primary transport supplies an exact `Content-Length`; chunked framing is kept
+as a retry fallback for hosted-instance variability. A failed short staged
+transaction is retired by its exact generated name before a bounded retry.
+The decoded body is an exact contiguous source-ZIP byte range and receives a
+full anonymous size/SHA-256 verification through its attachment UUID.
 
 The first bootstrap still has to transfer the current approximately 20.8 GB
 once between the services. Later runs reuse unchanged package attachments and

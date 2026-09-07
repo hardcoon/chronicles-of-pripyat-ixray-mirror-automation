@@ -52,6 +52,7 @@ MIRROR_TRANSPORT_FIELD = "mirrorTransport"
 MIRROR_TRANSPORT_SCHEMA_VERSION = 1
 SEGMENT_SIZE_BYTES = 256 * 1024 * 1024
 MAX_SEGMENT_COUNT = 9999
+STAGED_UPLOAD_ATTEMPTS = 4
 PLACEHOLDER_SHA256 = "0" * 64
 
 
@@ -1190,7 +1191,14 @@ class GiteaReleaseClient:
             raise MirrorError("Gitea release disappeared during synchronization")
         return release, self.release_assets(release)
 
-    def upload(self, release_id: int, path: Path, target_name: str) -> TargetAsset:
+    def upload(
+        self,
+        release_id: int,
+        path: Path,
+        target_name: str,
+        *,
+        chunked: bool = False,
+    ) -> TargetAsset:
         token = self.require_token()
         target_name = validate_asset_name(target_name, "target attachment name")
         size = path.stat().st_size
@@ -1216,19 +1224,25 @@ class GiteaReleaseClient:
             # Gitea do not have to parse/spool another multi-gigabyte form
             # upload before committing the release attachment.
             connection.putheader("Content-Type", "application/octet-stream")
-            # Gitea's public reverse proxy can buffer a known-length request
-            # and abort a multi-gigabyte release attachment before the backend
-            # consumes it.  Stream HTTP/1.1 chunks instead, matching the
-            # transport Gitea uses for large LFS uploads.  This is transport
-            # framing only; Gitea receives the exact original file bytes.
-            connection.putheader("Transfer-Encoding", "chunked")
+            # Mirror packages are application-segmented to at most 256 MiB.
+            # Prefer a known length for those bounded objects: hosted reverse
+            # proxies can commit a truncated attachment when a long chunked
+            # request reaches their upstream timeout. Chunked framing remains
+            # available as a retry transport for hosted-instance variability.
+            if chunked:
+                connection.putheader("Transfer-Encoding", "chunked")
+            else:
+                connection.putheader("Content-Length", str(size))
             connection.endheaders()
             with path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-                    connection.send(f"{len(chunk):X}\r\n".encode("ascii"))
+                    if chunked:
+                        connection.send(f"{len(chunk):X}\r\n".encode("ascii"))
                     connection.send(chunk)
-                    connection.send(b"\r\n")
-            connection.send(b"0\r\n\r\n")
+                    if chunked:
+                        connection.send(b"\r\n")
+            if chunked:
+                connection.send(b"0\r\n\r\n")
             response = connection.getresponse()
             payload = response.read()
         finally:
@@ -1306,10 +1320,7 @@ def all_target_assets(assets: TargetAssets) -> list[TargetAsset]:
 def pending_transaction_candidates(
     assets: TargetAssets, spec: AssetSpec
 ) -> list[TargetAsset]:
-    pattern = re.compile(
-        rf"^{re.escape(spec.name)}\.pending-{re.escape(spec.sha256[:12])}-"
-        r"[1-9]\d*-[0-9a-f]{6}$"
-    )
+    pattern = pending_transaction_pattern(spec)
     return sorted(
         (
             asset
@@ -1318,6 +1329,13 @@ def pending_transaction_candidates(
             for asset in candidates
         ),
         key=lambda item: item.id,
+    )
+
+
+def pending_transaction_pattern(spec: AssetSpec) -> re.Pattern[str]:
+    return re.compile(
+        rf"^{re.escape(spec.name)}\.pending-{re.escape(spec.sha256[:12])}-"
+        r"[1-9]\d*-[0-9a-f]{6}$"
     )
 
 
@@ -1655,11 +1673,23 @@ def upload_with_reconciliation(
     target_name: str,
     spec: AssetSpec,
     temp_root: Path,
+    cleanup_authorized: bool = False,
 ) -> TargetAsset:
-    try:
-        return client.upload(release_id, source_path, target_name)
-    except Exception as upload_error:
+    last_upload_error: Exception | None = None
+    for upload_attempt in range(STAGED_UPLOAD_ATTEMPTS):
+        try:
+            # Prefer an exact Content-Length and alternate framing on retries
+            # so one transient hosted-proxy path cannot strand the mirror.
+            return client.upload(
+                release_id,
+                source_path,
+                target_name,
+                chunked=bool(upload_attempt % 2),
+            )
+        except Exception as upload_error:
+            last_upload_error = upload_error
         verified: list[TargetAsset] = []
+        candidates: list[TargetAsset] = []
         for attempt in range(3):
             try:
                 _, assets = client.refresh_assets(tag)
@@ -1686,10 +1716,85 @@ def upload_with_reconciliation(
                 break
             if attempt < 2:
                 time.sleep(min(2**attempt, 4))
+        owned_pending = pending_transaction_pattern(spec).fullmatch(target_name) is not None
+        incomplete = [candidate for candidate in candidates if 0 < candidate.size < spec.size]
+        if (
+            cleanup_authorized
+            and owned_pending
+            and candidates
+            and len(incomplete) == len(candidates)
+        ):
+            for candidate in incomplete:
+                print(
+                    f"retiring incomplete staged upload before retry: {candidate.name} "
+                    f"({candidate.size}/{spec.size} bytes)",
+                    file=sys.stderr,
+                )
+                delete_with_reconciliation(
+                    client=client,
+                    release_id=release_id,
+                    tag=tag,
+                    asset=candidate,
+                )
+            _, refreshed = client.refresh_assets(tag)
+            if target_candidates(refreshed, target_name):
+                raise MirrorError(
+                    f"incomplete staged upload {target_name} remained after deletion"
+                )
+            if upload_attempt + 1 < STAGED_UPLOAD_ATTEMPTS:
+                time.sleep(min(2 ** (upload_attempt + 1), 8))
+                continue
         raise MirrorError(
             f"Gitea upload status for {target_name} is ambiguous after error: "
             f"{upload_error}; found {len(verified)} verified candidates"
         ) from upload_error
+    raise MirrorError(
+        f"Gitea upload of {target_name} failed after {STAGED_UPLOAD_ATTEMPTS} "
+        f"attempts: {last_upload_error}"
+    ) from last_upload_error
+
+
+def retire_incomplete_pending_assets(
+    *,
+    client: GiteaReleaseClient,
+    release_id: int,
+    tag: str,
+    assets: TargetAssets,
+    spec: AssetSpec,
+    cleanup_authorized: bool,
+) -> TargetAssets:
+    """Delete only exact, short transaction names from interrupted uploads."""
+
+    incomplete = [
+        candidate
+        for candidate in pending_transaction_candidates(assets, spec)
+        if 0 < candidate.size < spec.size
+    ]
+    if not incomplete or not cleanup_authorized:
+        return assets
+    removed_ids = {candidate.id for candidate in incomplete}
+    for candidate in incomplete:
+        print(
+            f"retiring prior incomplete staged upload: {candidate.name} "
+            f"({candidate.size}/{spec.size} bytes)"
+        )
+        delete_with_reconciliation(
+            client=client,
+            release_id=release_id,
+            tag=tag,
+            asset=candidate,
+        )
+    _, refreshed = client.refresh_assets(tag)
+    remaining_ids = {
+        candidate.id
+        for candidate in pending_transaction_candidates(refreshed, spec)
+        if candidate.id in removed_ids
+    }
+    if remaining_ids:
+        raise MirrorError(
+            f"incomplete staged uploads remained after deletion: {sorted(remaining_ids)}"
+        )
+    return refreshed
 
 
 def rename_with_reconciliation(
@@ -1907,6 +2012,7 @@ def replace_mutable_attachment(
             target_name=pending_name,
             spec=spec,
             temp_root=temp_root,
+            cleanup_authorized=cleanup_authorized,
         )
     else:
         pending = staged
@@ -2113,6 +2219,14 @@ def sync_asset(
             certify_target(certifications, existing, spec)
             print(f"reused certified immutable asset: {spec.name}")
             return "certified-existing"
+    existing_assets = retire_incomplete_pending_assets(
+        client=client,
+        release_id=release_id,
+        tag=tag,
+        assets=existing_assets,
+        spec=spec,
+        cleanup_authorized=cleanup_authorized,
+    )
     staged = (
         verified_pending_asset(existing_assets, spec, temp_root)
         if mutable or stage_new_immutable
@@ -2164,6 +2278,7 @@ def sync_asset(
                 target_name=spec.name,
                 spec=spec,
                 temp_root=temp_root,
+                cleanup_authorized=cleanup_authorized,
             )
             verify_public_target(uploaded, spec, temp_root)
             certify_target(certifications, uploaded, spec)

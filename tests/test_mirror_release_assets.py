@@ -115,7 +115,7 @@ class FakeGiteaClient:
         self.events.append(("refresh", tag))
         return {"id": 99}, self.grouped()
 
-    def upload(self, release_id, path, target_name):
+    def upload(self, release_id, path, target_name, *, chunked=False):
         asset = target(self.next_id, target_name, path.stat().st_size)
         self.next_id += 1
         self.events.append(("upload", asset.id, target_name))
@@ -196,7 +196,7 @@ class FakeUploadConnection:
 
 
 class GiteaRawUploadTests(unittest.TestCase):
-    def test_upload_streams_exact_raw_octet_body_with_chunked_transport(self):
+    def test_upload_streams_exact_raw_octet_body_with_content_length(self):
         payload = b"release-package-bytes"
         response_record = {
             "id": 42,
@@ -234,14 +234,81 @@ class GiteaRawUploadTests(unittest.TestCase):
             ),
         )
         self.assertEqual(connection.headers["content-type"], "application/octet-stream")
+        self.assertEqual(connection.headers["content-length"], str(len(payload)))
+        self.assertNotIn("transfer-encoding", connection.headers)
+        self.assertNotIn("multipart", connection.headers["content-type"])
+        self.assertEqual(bytes(connection.body), payload)
+        self.assertTrue(connection.closed)
+
+    def test_upload_can_fall_back_to_chunked_transport(self):
+        payload = b"release-package-bytes"
+        response_record = {
+            "id": 42,
+            "uuid": "00000000-0000-0000-0000-000000000042",
+            "name": "package.zip",
+            "size": len(payload),
+            "browser_download_url": "https://example.invalid/package.zip",
+        }
+        connection = FakeUploadConnection(
+            FakeResponse(json.dumps(response_record).encode("utf-8"), 201)
+        )
+        client = GiteaReleaseClient(
+            "https://example.invalid", "owner/repo", token="secret-token"
+        )
+        with tempfile.TemporaryDirectory() as temp_name:
+            source = Path(temp_name) / "local-source.zip"
+            source.write_bytes(payload)
+            with patch.object(
+                mirror.http.client, "HTTPSConnection", return_value=connection
+            ):
+                client.upload(99, source, "package.zip", chunked=True)
         self.assertEqual(connection.headers["transfer-encoding"], "chunked")
         self.assertNotIn("content-length", connection.headers)
-        self.assertNotIn("multipart", connection.headers["content-type"])
         self.assertEqual(
             bytes(connection.body),
             f"{len(payload):X}\r\n".encode("ascii") + payload + b"\r\n0\r\n\r\n",
         )
-        self.assertTrue(connection.closed)
+
+    def test_short_staged_upload_is_deleted_then_retried(self):
+        spec = AssetSpec("package.zip", 3, SHA_A, "test")
+
+        class PartialOnceClient(FakeGiteaClient):
+            def __init__(self):
+                super().__init__()
+                self.attempt = 0
+
+            def upload(self, release_id, path, target_name, *, chunked=False):
+                self.attempt += 1
+                if self.attempt == 1:
+                    partial = target(self.next_id, target_name, path.stat().st_size - 1)
+                    self.next_id += 1
+                    self.assets[partial.id] = partial
+                    self.events.append(("upload", partial.id, target_name))
+                    raise TimeoutError("proxy returned 502 after a short commit")
+                return super().upload(
+                    release_id, path, target_name, chunked=chunked
+                )
+
+        client = PartialOnceClient()
+        pending_name = f"{spec.name}.pending-{spec.sha256[:12]}-123456-abcdef"
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp_root = Path(temp_name)
+            source = temp_root / spec.name
+            source.write_bytes(b"abc")
+            with patch.object(mirror.time, "sleep"):
+                uploaded = mirror.upload_with_reconciliation(
+                    client=client,
+                    release_id=99,
+                    tag="dev-channel",
+                    source_path=source,
+                    target_name=pending_name,
+                    spec=spec,
+                    temp_root=temp_root,
+                    cleanup_authorized=True,
+                )
+        self.assertEqual(client.attempt, 2)
+        self.assertIn(("delete", 1), client.events)
+        self.assertEqual(uploaded.size, spec.size)
 
 
 class ManifestAssetsTests(unittest.TestCase):
