@@ -100,11 +100,15 @@ source tag `dev-2026.08.26.1`; it has no manual `source_tag` write input.
 
 There is deliberately no prefix scan or general "stale asset" sweep. Every
 delta still present anywhere in the new manifest remains referenced and is
-therefore retained. Only after the new canonical manifest has passed anonymous
-UUID and name-route verification may the script prune an immutable attachment
-whose exact ID/name/size/SHA came from a fully parsed previous target manifest
-and whose name is absent from the new physical transport. Arbitrary
-unreferenced orphan parts are not deleted. Exact short
+therefore retained. Immutable package pruning is disabled by default and the
+production workflow never enables it: Gitea is an append-only disaster-recovery
+archive, so superseded direct packages and segmented parts remain available.
+The command-line-only `--prune-stale-packages` escape hatch exists for an
+explicitly audited maintenance operation; only after the new canonical
+manifest has passed anonymous UUID and name-route verification may that mode
+prune an immutable attachment whose exact ID/name/size/SHA came from a fully
+parsed previous target manifest and whose name is absent from the new physical
+transport. Arbitrary unreferenced orphan parts are not deleted. Exact short
 `.pending-<sha-prefix>-<timestamp>-<nonce>` transactions created for the same
 desired asset may be retired after the manifest-progression guard succeeds;
 all other cleanup remains limited to exact transaction-owned IDs. Package

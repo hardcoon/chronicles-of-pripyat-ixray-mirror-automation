@@ -407,6 +407,12 @@ class ManifestAssetsTests(unittest.TestCase):
     def test_permanent_target_tag_is_the_cli_default(self):
         self.assertEqual(parse_args([]).gitea_tag, "dev-channel")
 
+    def test_stale_package_pruning_is_disabled_by_default(self):
+        self.assertFalse(parse_args([]).prune_stale_packages)
+        self.assertTrue(
+            parse_args(["--prune-stale-packages"]).prune_stale_packages
+        )
+
     def test_gitea_asset_parser_preserves_duplicate_names_for_recovery(self):
         release = {
             "assets": [

@@ -2623,6 +2623,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
             "enables this automatically."
         ),
     )
+    parser.add_argument(
+        "--prune-stale-packages",
+        action="store_true",
+        help=(
+            "Explicitly delete exact immutable packages referenced only by an older "
+            "target manifest. Disabled by default so Gitea remains an append-only "
+            "disaster-recovery archive; the production workflow never enables it."
+        ),
+    )
     parser.add_argument("--max-assets", type=int, default=512)
     parser.add_argument("--max-asset-bytes", type=int, default=2_100_000_000)
     parser.add_argument("--max-total-bytes", type=int, default=35_000_000_000)
@@ -2937,7 +2946,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
         planned_prune = (
             []
-            if args.probe_largest_full
+            if args.probe_largest_full or not args.prune_stale_packages
             else [
                 {"name": spec.name, "id": asset.id, "size": spec.size}
                 for asset, spec in stale_published_candidates(
@@ -2988,6 +2997,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "totalBytes": total_size,
             "manifestWillChange": manifest_will_change,
             "manifestIsLast": not args.probe_largest_full,
+            "stalePackagePruneEnabled": args.prune_stale_packages,
             "bootstrapCleanup": bootstrap_cleanup,
             "postManifestPrune": planned_prune,
             "actions": actions,
@@ -3170,10 +3180,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         _, target_assets = target_client.refresh_assets(args.gitea_tag)
         require_certified_targets(target_assets, physical_specs, certifications)
-        stale_candidates = stale_published_candidates(
-            published_state,
-            target_assets,
-            physical_specs,
+        stale_candidates = (
+            stale_published_candidates(
+                published_state,
+                target_assets,
+                physical_specs,
+            )
+            if args.prune_stale_packages
+            else []
         )
 
         derived_manifest = build_derived_manifest(
@@ -3249,6 +3263,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "manifestSha256": derived_manifest_digest,
             "manifestProgression": progression,
             "rollbackOverride": allow_rollback,
+            "stalePackagePruneEnabled": args.prune_stale_packages,
             "target": f"{args.gitea_url}/{args.gitea_repo}/releases/tag/{args.gitea_tag}",
             "assetCount": len(physical_specs) + 1,
             "logicalPackageCount": len(package_specs),
